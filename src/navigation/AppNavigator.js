@@ -20,7 +20,13 @@ export function AppNavigator() {
       <Tab.Navigator
         screenOptions={{
           headerShown:        false,
-          tabBarStyle:        { backgroundColor: colors.bg2, borderTopColor: colors.border },
+          tabBarStyle: {
+            backgroundColor: colors.bg1,
+            borderTopColor:  colors.border,
+            borderTopWidth:  1,
+            height:          58,
+            paddingBottom:   8,
+          },
           tabBarActiveTintColor:   colors.accent,
           tabBarInactiveTintColor: colors.text3,
           tabBarLabelStyle:   { fontFamily: 'Courier New', fontSize: 11 },

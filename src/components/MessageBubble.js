@@ -1,3 +1,4 @@
+// src/components/MessageBubble.js
 import React from 'react';
 import { View, Text, StyleSheet, ActivityIndicator } from 'react-native';
 import Markdown from 'react-native-markdown-display';
@@ -5,99 +6,214 @@ import { OfflineChunkCard } from './OfflineChunkCard';
 import { colors, spacing, radius, typography } from '../config/theme';
 
 const markdownStyles = {
-  body:      { color: colors.text1, fontSize: typography.fontSize.md, lineHeight: 22 },
-  code_block:{ backgroundColor: colors.bg3, padding: spacing.sm, borderRadius: radius.sm },
-  code_inline:{ backgroundColor: colors.bg3, color: colors.teal, fontFamily: 'Courier New' },
-  heading1:  { color: colors.text0, fontSize: typography.fontSize.xl },
-  heading2:  { color: colors.text0, fontSize: typography.fontSize.lg },
-  strong:    { color: colors.text0 },
+  body:        { color: colors.text1, fontSize: typography.fontSize.md, lineHeight: 23 },
+  code_block:  { backgroundColor: colors.bg3, padding: spacing.sm, borderRadius: radius.sm },
+  code_inline: { backgroundColor: colors.bg3, color: colors.teal, fontFamily: typography.fontMono },
+  heading1:    { color: colors.text0, fontSize: typography.fontSize.xl, fontWeight: '700' },
+  heading2:    { color: colors.text0, fontSize: typography.fontSize.lg, fontWeight: '600' },
+  heading3:    { color: colors.text0, fontSize: typography.fontSize.md, fontWeight: '600' },
+  strong:      { color: colors.text0, fontWeight: '600' },
+  em:          { color: colors.text2, fontStyle: 'italic' },
+  bullet_list: { color: colors.text1 },
+  list_item:   { color: colors.text1, marginBottom: 2 },
+  table:       { borderWidth: 1, borderColor: colors.border },
+  th:          { backgroundColor: colors.bg3, padding: 6, color: colors.accentText },
+  td:          { padding: 6, color: colors.text1, borderTopWidth: 1, borderColor: colors.border },
+  blockquote:  {
+    borderLeftWidth: 2, borderLeftColor: colors.accentDim,
+    paddingLeft: 10, marginLeft: 0, backgroundColor: colors.bg3,
+  },
 };
 
-export function MessageBubble({ message }) {
+/**
+ * Props:
+ *   message   object  — message from useChat
+ *   onOpenPdf fn      — (source, page, bbox) => void — wired from ChatScreen
+ */
+export function MessageBubble({ message, onOpenPdf }) {
   const isUser = message.role === 'user';
 
+  // ── User bubble ──────────────────────────────────────────────────────────
   if (isUser) {
     return (
       <View style={styles.userRow}>
         <View style={styles.userBubble}>
+          <Text style={styles.userLabel}>YOU</Text>
           <Text style={styles.userText}>{message.content}</Text>
         </View>
       </View>
     );
   }
 
-  // Offline: show chunk cards
+  // ── Offline: chunk cards ─────────────────────────────────────────────────
   if (message.is_offline) {
+    const chunks = message.offline_chunks || [];
     return (
       <View style={styles.assistantRow}>
-        <View style={styles.offlineHeader}>
-          <Text style={styles.offlineLabel}>◈ Retrieved sections</Text>
+        <View style={styles.assistantBubble}>
+          <View style={styles.offlineHeader}>
+            <Text style={styles.offlineLabel}>◈  RETRIEVED SECTIONS</Text>
+            {chunks.length > 0 && (
+              <View style={styles.countBadge}>
+                <Text style={styles.countText}>{chunks.length}</Text>
+              </View>
+            )}
+          </View>
+
+          {chunks.length === 0 && !message.isError && (
+            <Text style={styles.emptyText}>No matching sections found.</Text>
+          )}
+          {message.isError && (
+            <Text style={styles.errorText}>{message.content}</Text>
+          )}
+
+          {chunks.map((chunk, i) => (
+            <OfflineChunkCard
+              key={chunk.id || i}
+              chunk={chunk}
+              onOpenPdf={onOpenPdf}   // ← was missing in original — now wired
+            />
+          ))}
         </View>
-        {(message.offline_chunks || []).map((chunk, i) => (
-          <OfflineChunkCard key={chunk.id || i} chunk={chunk} />
-        ))}
-        {message.offline_chunks?.length === 0 && !message.isError && (
-          <Text style={styles.emptyText}>No matching sections found.</Text>
-        )}
-        {message.isError && (
-          <Text style={styles.errorText}>{message.content}</Text>
-        )}
       </View>
     );
   }
 
-  // Online: streaming markdown
+  // ── Online: streaming markdown ───────────────────────────────────────────
   return (
     <View style={styles.assistantRow}>
       <View style={styles.assistantBubble}>
+        <Text style={styles.assistantLabel}>MARINEDOC</Text>
+
         {message.content ? (
-          <Markdown style={markdownStyles}>{message.content}</Markdown>
+          <>
+            <Markdown style={markdownStyles}>{message.content}</Markdown>
+            {message.streaming && <Text style={styles.cursor}>▊</Text>}
+          </>
         ) : (
           <ActivityIndicator size="small" color={colors.accent} />
         )}
-        {message.streaming && message.content ? (
-          <Text style={styles.cursor}>▊</Text>
-        ) : null}
-      </View>
 
-      {/* Citations */}
-      {(message.citations || []).length > 0 && (
-        <View style={styles.citations}>
-          {message.citations.map((c, i) => (
-            <View key={i} style={styles.citationChip}>
-              <Text style={styles.citationText} numberOfLines={1}>
-                {c.source}{c.page ? ` p${c.page}` : ''}
-              </Text>
-            </View>
-          ))}
-        </View>
-      )}
+        {/* Citations */}
+        {!message.streaming && (message.citations || []).length > 0 && (
+          <View style={styles.citations}>
+            {message.citations.map((c, i) => (
+              <View key={i} style={styles.citationChip}>
+                <Text style={styles.citationText} numberOfLines={1}>
+                  📄 {c.source}{c.page ? ` · p${c.page}` : ''}
+                </Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {/* Token count */}
+        {!message.streaming && message.usage?.total_tokens && (
+          <Text style={styles.tokenCount}>
+            {message.usage.total_tokens.toLocaleString()} tokens
+          </Text>
+        )}
+      </View>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  userRow:        { alignItems: 'flex-end', marginVertical: spacing.xs },
-  userBubble:     { backgroundColor: colors.accent, borderRadius: radius.lg,
-                    paddingHorizontal: spacing.md, paddingVertical: spacing.sm,
-                    maxWidth: '80%' },
-  userText:       { color: '#fff', fontSize: typography.fontSize.md },
-  assistantRow:   { alignItems: 'flex-start', marginVertical: spacing.xs },
-  assistantBubble:{ backgroundColor: colors.bg2, borderRadius: radius.lg,
-                    borderWidth: 1, borderColor: colors.border,
-                    paddingHorizontal: spacing.md, paddingVertical: spacing.sm,
-                    maxWidth: '92%' },
-  cursor:         { color: colors.accent, fontSize: 14 },
-  offlineHeader:  { flexDirection: 'row', alignItems: 'center', marginBottom: spacing.xs },
-  offlineLabel:   { color: colors.text2, fontSize: typography.fontSize.sm,
-                    fontFamily: 'Courier New' },
-  emptyText:      { color: colors.text3, fontSize: typography.fontSize.sm, padding: spacing.sm },
-  errorText:      { color: colors.error, fontSize: typography.fontSize.sm, padding: spacing.sm },
-  citations:      { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs,
-                    marginTop: spacing.xs, maxWidth: '92%' },
-  citationChip:   { backgroundColor: colors.bg3, borderRadius: radius.full,
-                    borderWidth: 1, borderColor: colors.border,
-                    paddingHorizontal: spacing.sm, paddingVertical: 2 },
-  citationText:   { color: colors.accentText, fontSize: typography.fontSize.xs,
-                    fontFamily: 'Courier New' },
+  // User
+  userRow:    { alignItems: 'flex-end', marginVertical: spacing.xs },
+  userBubble: {
+    backgroundColor:    '#1e1b3a',
+    borderRadius:       radius.lg,
+    borderTopRightRadius: radius.sm,
+    borderWidth:        1,
+    borderColor:        'rgba(124,106,247,0.22)',
+    paddingHorizontal:  spacing.md,
+    paddingVertical:    spacing.sm,
+    maxWidth:           '82%',
+  },
+  userLabel: {
+    fontSize:     typography.fontSize.xs,
+    color:        colors.accentDim,
+    fontFamily:   typography.fontMono,
+    letterSpacing: 0.8,
+    marginBottom:  5,
+  },
+  userText: { color: colors.text0, fontSize: typography.fontSize.md, lineHeight: 22 },
+
+  // Assistant
+  assistantRow: { alignItems: 'flex-start', marginVertical: spacing.xs },
+  assistantBubble: {
+    backgroundColor:    colors.bg2,
+    borderRadius:       radius.lg,
+    borderTopLeftRadius: radius.sm,
+    borderWidth:        1,
+    borderColor:        colors.borderMd,
+    paddingHorizontal:  spacing.md,
+    paddingVertical:    spacing.md,
+    maxWidth:           '95%',
+    width:              '95%',
+  },
+  assistantLabel: {
+    fontSize:     typography.fontSize.xs,
+    color:        colors.accentText,
+    fontFamily:   typography.fontMono,
+    letterSpacing: 0.8,
+    marginBottom:  8,
+  },
+  cursor: { color: colors.accent, fontSize: 14, marginTop: 2 },
+
+  // Offline header
+  offlineHeader: {
+    flexDirection: 'row', alignItems: 'center',
+    marginBottom:  spacing.md, gap: spacing.sm,
+  },
+  offlineLabel: {
+    fontSize:     typography.fontSize.xs,
+    color:        colors.text2,
+    fontFamily:   typography.fontMono,
+    letterSpacing: 0.8,
+    flex:          1,
+  },
+  countBadge: {
+    backgroundColor:   colors.bg4,
+    borderRadius:      radius.full,
+    paddingHorizontal: 8,
+    paddingVertical:   2,
+    borderWidth:       1,
+    borderColor:       colors.border,
+  },
+  countText: {
+    fontSize:   typography.fontSize.xs,
+    color:      colors.teal,
+    fontFamily: typography.fontMono,
+  },
+
+  emptyText: { color: colors.text3, fontSize: typography.fontSize.sm, paddingVertical: spacing.sm },
+  errorText: { color: colors.error, fontSize: typography.fontSize.sm, paddingVertical: spacing.sm },
+
+  // Citations
+  citations:    {
+    flexDirection: 'row', flexWrap: 'wrap',
+    gap: spacing.xs, marginTop: spacing.md,
+  },
+  citationChip: {
+    backgroundColor:   colors.bg3,
+    borderRadius:      radius.full,
+    borderWidth:       1,
+    borderColor:       colors.border,
+    paddingHorizontal: spacing.sm,
+    paddingVertical:   3,
+  },
+  citationText: {
+    color:      colors.accentText,
+    fontSize:   typography.fontSize.xs,
+    fontFamily: typography.fontMono,
+  },
+  tokenCount: {
+    marginTop:  spacing.sm,
+    textAlign:  'right',
+    fontSize:   typography.fontSize.xs,
+    color:      colors.text3,
+    fontFamily: typography.fontMono,
+  },
 });

@@ -1,17 +1,7 @@
 // src/hooks/useChat.js
-//
-// FINAL VERSION — Mode 3 (DEEP_OFFLINE) now uses real local SQLite search
-// via useOfflineSearch instead of the placeholder stub.
-//
-// Three complete branches:
-//   ONLINE       → XHR SSE streaming to /chat/stream
-//   LAN_ONLY     → POST /chat/offline (server retrieval, no LLM)
-//   DEEP_OFFLINE → searchChunks() against local SQLite FTS5 index
-
-import { useState, useCallback, useRef }       from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { streamChat, fetchOfflineResponse, clearSession } from '../api/chat';
-import { NetworkMode }                          from './useNetwork';
-import { searchChunks }                         from '../offline/db';
+import { searchChunks } from '../offline/db';  // Mode 3: local SQLite FTS
 
 export function useChat() {
   const [messages,   setMessages]   = useState([]);
@@ -19,68 +9,53 @@ export function useChat() {
   const [statusText, setStatusText] = useState('');
   const cancelRef = useRef(null);
 
-  // ── HELPER ─────────────────────────────────────────────────
-  const patchMsg = useCallback((id, patch) => {
-    setMessages(prev => prev.map(m => (m.id === id ? { ...m, ...patch } : m)));
-  }, []);
-
-  // ─────────────────────────────────────────────────────────
-  // SEND
-  // ─────────────────────────────────────────────────────────
-  const send = useCallback(async (
-    question,
-    mode       = NetworkMode.ONLINE,
-    pinnedFile = null,
-  ) => {
+  /**
+   * send(question, mode, pinnedFile)
+   *
+   * mode: 'full_online' | 'intranet_only' | 'deep_offline'
+   *
+   * Mode 1 full_online   — XHR SSE stream to /chat/stream (Groq LLM)
+   * Mode 2 intranet_only — POST /chat/offline (retrieval only, server-side)
+   * Mode 3 deep_offline  — local SQLite FTS via db.searchChunks()
+   */
+  const send = useCallback(async (question, mode = 'full_online', pinnedFile = null) => {
     if (streaming) return;
 
-    const userMsg     = { id: Date.now(),     role: 'user', content: question };
-    const assistantId =   Date.now() + 1;
+    const userMsg     = { id: Date.now(), role: 'user', content: question };
+    const assistantId = Date.now() + 1;
     setMessages(prev => [...prev, userMsg]);
 
-
-    // ── MODE 3: Deep offline — local SQLite FTS5 search ────────────
-    if (mode === NetworkMode.DEEP_OFFLINE) {
+    // ── MODE 3: Deep offline (no server connection) ──────────────────────
+    if (mode === 'deep_offline') {
       setMessages(prev => [...prev, {
-        id:             assistantId,
-        role:           'assistant',
-        is_offline:     true,
-        offline_chunks: [],
-        content:        '',
-        citations:      [],
-        _deepOffline:   true,
+        id: assistantId, role: 'assistant', content: '',
+        is_offline: true, offline_chunks: [],
       }]);
       setStreaming(true);
       setStatusText('Searching local database…');
 
       try {
         const rawChunks = await searchChunks(question, 5);
-
-        if (rawChunks.length === 0) {
-          patchMsg(assistantId, {
-            offline_chunks: [],
-            content: '⚡ No matching sections found in local database. ' +
-                     'Connect to the server to sync the latest documents.',
-          });
-        } else {
-          // Shape to match what MessageBubble / OfflineChunkCard expects
-          const chunks = rawChunks.map((c, i) => ({
-            id:      c.id || i,
-            source:  c.source,
-            content: c.content,   // already parent_content from db.searchChunks
-            page:    c.page,
-            type:    c.chunk_type || 'text',
-            score:   c.score,
-            rank:    i + 1,
-          }));
-          patchMsg(assistantId, { offline_chunks: chunks });
-        }
+        // Normalize to the same shape as server offline chunks
+        const chunks = rawChunks.map(c => ({
+          source:       c.source,
+          page:         c.page,
+          content:      c.parent_content || c.content,
+          score:        c.score || 0,
+          chunk_type:   c.chunk_type || 'text',
+          section_path: '',
+          heading:      '',
+          bbox:         null,
+        }));
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId ? { ...m, offline_chunks: chunks } : m
+        ));
       } catch (err) {
-        console.error('[useChat] Local search error:', err);
-        patchMsg(assistantId, {
-          content: `⚡ Local search failed: ${err.message}`,
-          isError: true,
-        });
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId
+            ? { ...m, content: `⚠️ Local search failed: ${err.message}`, isError: true }
+            : m
+        ));
       } finally {
         setStreaming(false);
         setStatusText('');
@@ -88,28 +63,28 @@ export function useChat() {
       return;
     }
 
-
-    // ── MODE 2: LAN only — server retrieval, no LLM ─────────────────
-    if (mode === NetworkMode.LAN_ONLY) {
+    // ── MODE 2: Intranet only (server up, no internet / Groq) ────────────
+    if (mode === 'intranet_only') {
       setMessages(prev => [...prev, {
-        id:             assistantId,
-        role:           'assistant',
-        is_offline:     true,
-        offline_chunks: [],
-        content:        '',
-        citations:      [],
+        id: assistantId, role: 'assistant', content: '',
+        is_offline: true, offline_chunks: [],
       }]);
       setStreaming(true);
       setStatusText('Searching manual sections…');
 
       try {
         const result = await fetchOfflineResponse(question, pinnedFile);
-        patchMsg(assistantId, { offline_chunks: result.chunks ?? [] });
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId
+            ? { ...m, offline_chunks: result.chunks || [] }
+            : m
+        ));
       } catch (err) {
-        patchMsg(assistantId, {
-          content: `⚠️ ${err.message}`,
-          isError: true,
-        });
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId
+            ? { ...m, content: `⚠️ ${err.message}`, isError: true }
+            : m
+        ));
       } finally {
         setStreaming(false);
         setStatusText('');
@@ -117,15 +92,10 @@ export function useChat() {
       return;
     }
 
-
-    // ── MODE 1: Full online — XHR SSE streaming ──────────────────────
+    // ── MODE 1: Full online — XHR SSE streaming ──────────────────────────
     setMessages(prev => [...prev, {
-      id:         assistantId,
-      role:       'assistant',
-      content:    '',
-      streaming:  true,
-      citations:  [],
-      image_urls: [],
+      id: assistantId, role: 'assistant', content: '',
+      streaming: true, citations: [], image_urls: [],
     }]);
     setStreaming(true);
     setStatusText('Searching documents…');
@@ -139,54 +109,53 @@ export function useChat() {
           setMessages(prev => prev.map(m =>
             m.id === assistantId
               ? { ...m, content: m.content + event.token }
-              : m,
+              : m
           ));
-
         } else if (event.done === true) {
-          patchMsg(assistantId, {
-            streaming:  false,
-            citations:  event.citations   || [],
-            image_urls: event.image_urls  || [],
-            usage:      event.usage       || {},
-          });
+          setMessages(prev => prev.map(m =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  streaming:  false,
+                  citations:  event.citations  || [],
+                  image_urls: event.image_urls || [],
+                  usage:      event.usage      || {},
+                }
+              : m
+          ));
           setStreaming(false);
           setStatusText('');
-
         } else if (event.type === 'error' || event.error) {
-          patchMsg(assistantId, {
-            content:   `⚠️ ${event.message || event.error}`,
-            streaming: false,
-          });
+          setMessages(prev => prev.map(m =>
+            m.id === assistantId
+              ? { ...m, content: `⚠️ ${event.message || event.error}`, streaming: false }
+              : m
+          ));
           setStreaming(false);
           setStatusText('');
         }
       },
-
       onDone: () => {
         setMessages(prev => prev.map(m =>
-          m.id === assistantId && m.streaming
-            ? { ...m, streaming: false }
-            : m,
+          m.id === assistantId && m.streaming ? { ...m, streaming: false } : m
         ));
         setStreaming(false);
         setStatusText('');
       },
-
       onError: (err) => {
-        patchMsg(assistantId, {
-          content:   `⚠️ ${err.message}`,
-          streaming: false,
-        });
+        setMessages(prev => prev.map(m =>
+          m.id === assistantId
+            ? { ...m, content: `⚠️ ${err.message}`, streaming: false }
+            : m
+        ));
         setStreaming(false);
         setStatusText('');
       },
     });
 
     cancelRef.current = cancel;
-  }, [streaming, patchMsg]);
+  }, [streaming]);
 
-
-  // ── CANCEL / CLEAR ─────────────────────────────────────────
   const cancel = useCallback(() => {
     cancelRef.current?.();
     setStreaming(false);
@@ -195,7 +164,7 @@ export function useChat() {
 
   const clear = useCallback(async () => {
     cancelRef.current?.();
-    await clearSession().catch(() => {});
+    try { await clearSession(); } catch { /* ignore if offline */ }
     setMessages([]);
   }, []);
 

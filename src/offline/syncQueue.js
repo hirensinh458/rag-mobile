@@ -14,29 +14,29 @@
 //   - Max 5 attempts per sync trigger
 //   - Gives up gracefully; next poll interval will retry
 
-import { getBaseUrl }     from '../api/client';
+import { getBaseUrl } from '../api/client';
 import {
   replaceAllChunks,
   getChunkCount,
   getSyncMeta,
   setSyncMeta,
 } from './db';
-
+import { syncPdfs } from './pdfSync';
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────
-const SYNC_TIMEOUT_MS  = 30_000; // abort if server doesn't respond in 30s
-const MAX_RETRIES      = 5;
-const BASE_BACKOFF_MS  = 2_000;
-const MAX_BACKOFF_MS   = 30_000;
+const SYNC_TIMEOUT_MS = 30_000; // abort if server doesn't respond in 30s
+const MAX_RETRIES = 5;
+const BASE_BACKOFF_MS = 2_000;
+const MAX_BACKOFF_MS = 30_000;
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // re-sync every 5 minutes when online
 
 // ─────────────────────────────────────────────────────────────
 // STATE
 // ─────────────────────────────────────────────────────────────
-let _syncing       = false;
-let _retryCount    = 0;
-let _retryTimer    = null;
+let _syncing = false;
+let _retryCount = 0;
+let _retryTimer = null;
 let _onStatusChange = null; // callback: (status) => void
 
 /** Register a callback to be called when sync status changes */
@@ -71,15 +71,15 @@ export async function syncFromServer() {
   _emit({ syncing: true, phase: 'connecting' });
 
   try {
-    const base       = await getBaseUrl();
+    const base = await getBaseUrl();
     const controller = new AbortController();
-    const timeout    = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
+    const timeout = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
 
     let response;
     try {
       _emit({ syncing: true, phase: 'fetching' });
       response = await fetch(`${base}/kb/export`, {
-        signal:  controller.signal,
+        signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
       });
     } finally {
@@ -90,7 +90,7 @@ export async function syncFromServer() {
       throw new Error(`Server returned ${response.status}`);
     }
 
-    const data   = await response.json();
+    const data = await response.json();
     const chunks = data.chunks || [];
 
     if (chunks.length === 0) {
@@ -106,19 +106,30 @@ export async function syncFromServer() {
     await replaceAllChunks(chunks);
 
     const now = new Date().toISOString();
-    await setSyncMeta('last_synced',  now);
-    await setSyncMeta('chunk_count',  String(chunks.length));
+    await setSyncMeta('last_synced', now);
+    await setSyncMeta('chunk_count', String(chunks.length));
     await setSyncMeta('server_total', String(data.total || chunks.length));
 
     console.log(`[SYNC] ✅ Synced ${chunks.length} chunks at ${now}`);
     _retryCount = 0;
     _emit({ syncing: false, phase: 'done', chunkCount: chunks.length, lastSynced: now });
 
-    return { success: true, chunkCount: chunks.length };
+    // 🔽 ADD THIS BLOCK HERE
+    // Sync PDFs in the same pass — non-blocking, errors are logged only
+    try {
+      const pdfResult = await syncPdfs();
+      if (pdfResult.errors.length > 0) {
+        console.warn('[SYNC] PDF errors:', pdfResult.errors);
+      }
+    } catch (e) {
+      console.warn('[SYNC] PDF sync failed (non-blocking):', e.message);
+    }
 
+    return { success: true, chunkCount: chunks.length };
+    
   } catch (err) {
     const isAbort = err.name === 'AbortError';
-    const msg     = isAbort ? 'Sync timed out' : err.message;
+    const msg = isAbort ? 'Sync timed out' : err.message;
     console.warn(`[SYNC] ❌ Failed (attempt ${_retryCount + 1}): ${msg}`);
 
     _emit({ syncing: false, phase: 'error', error: msg });
@@ -174,15 +185,15 @@ export async function shouldSync() {
 
 /** Read current sync metadata for display in the UI */
 export async function getSyncStatus() {
-  const lastSynced  = await getSyncMeta('last_synced');
-  const chunkCount  = await getSyncMeta('chunk_count');
-  const localCount  = await getChunkCount();
+  const lastSynced = await getSyncMeta('last_synced');
+  const chunkCount = await getSyncMeta('chunk_count');
+  const localCount = await getChunkCount();
 
   return {
-    lastSynced:  lastSynced  || null,
-    chunkCount:  parseInt(chunkCount || '0', 10),
+    lastSynced: lastSynced || null,
+    chunkCount: parseInt(chunkCount || '0', 10),
     localCount,
-    isSyncing:   _syncing,
+    isSyncing: _syncing,
   };
 }
 

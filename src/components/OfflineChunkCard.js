@@ -43,7 +43,7 @@ export function OfflineChunkCard({ chunk, onOpenPdf }) {
           <Text style={styles.footerBtn}>{expanded ? 'Show less ↑' : 'Show more ↓'}</Text>
         </TouchableOpacity>
         {chunk.source && chunk.page && onOpenPdf && (
-          <TouchableOpacity onPress={() => onOpenPdf({ source: chunk.source, page: chunk.page, bbox: chunk.bbox })}>
+          <TouchableOpacity onPress={() => onOpenPdf(chunk.source, chunk.page, chunk.bbox)}>
             <Text style={styles.openBtn}>Open in manual →</Text>
           </TouchableOpacity>
         )}
