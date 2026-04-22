@@ -4,12 +4,28 @@
     "slug": "rag-mobile",
     "version": "1.0.0",
     "extra": {
-      "eas": {
-        "projectId": "3df568cc-8bca-4f72-8ce6-17cbdc5d68b6"
-      }
+      "eas": { "projectId": "3df568cc-8bca-4f72-8ce6-17cbdc5d68b6" }
     },
     "plugins": [
-      "expo-secure-store"
-    ]
+      "expo-secure-store",
+      "expo-dev-client",
+      "expo-sqlite",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
+          }
+        }
+      ]
+    ],
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0D0D12"
+      },
+      "package": "com.ragmobile"
+    },
+    "assets": ["./assets/models/"]
   }
 }

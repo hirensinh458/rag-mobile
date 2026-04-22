@@ -1,80 +1,73 @@
-import React, { useEffect, useRef, useMemo } from 'react';
+// src/components/NetworkBanner.js
+//
+// REWRITE: Mode-aware animated banner.
+//   - ONLINE      → no banner (collapses to 0 height with animation)
+//   - LAN_ONLY    → purple info strip
+//   - DEEP_OFFLINE → red warning strip
+
+import React, { useEffect, useRef }  from 'react';
 import { Animated, Text, StyleSheet } from 'react-native';
-import { colors } from '../config/theme';
+import { NetworkMode }                from '../hooks/useNetwork';
+import { colors, typography }         from '../config/theme';
 
-export function NetworkBanner({ serverReachable, serverHasInternet }) {
-  const slideAnim = useRef(new Animated.Value(-40)).current;
+const BANNER_HEIGHT = 34;
 
-  // Determine banner state
-  const bannerConfig = useMemo(() => {
-    if (!serverReachable) {
-      return {
-        show: true,
-        text: '📵 Server unreachable — local retrieval only',
-        backgroundColor: 'rgba(239,68,68,0.15)',
-        borderColor: 'rgba(239,68,68,0.3)',
-        textColor: '#ef8888',
-      };
-    }
+const CONFIG = {
+  [NetworkMode.ONLINE]: null, // no banner
 
-    if (!serverHasInternet) {
-      return {
-        show: true,
-        text: '⚓ At sea mode — manual search only, no AI',
-        backgroundColor: 'rgba(251,191,36,0.15)', // orange
-        borderColor: 'rgba(251,191,36,0.3)',
-        textColor: '#fbbf24',
-      };
-    }
+  [NetworkMode.LAN_ONLY]: {
+    bg:  'rgba(124, 106, 247, 0.15)',
+    msg: '◑  LAN mode — server connected, no internet · retrieval only',
+    fg:  colors.accentText,
+  },
 
-    return { show: false };
-  }, [serverReachable, serverHasInternet]);
+  [NetworkMode.DEEP_OFFLINE]: {
+    bg:  'rgba(239, 68, 68, 0.12)',
+    msg: '○  Server unreachable — using local database',
+    fg:  colors.error,
+  },
+};
 
-  // Animate banner visibility
+export function NetworkBanner({ mode }) {
+  const heightAnim = useRef(new Animated.Value(0)).current;
+  const config     = CONFIG[mode];
+
   useEffect(() => {
-    Animated.spring(slideAnim, {
-      toValue: bannerConfig.show ? 0 : -40,
-      useNativeDriver: true,
-      tension: 80,
-      friction: 10,
+    Animated.timing(heightAnim, {
+      toValue:         config ? BANNER_HEIGHT : 0,
+      duration:        250,
+      useNativeDriver: false, // animating height — must be false
     }).start();
-  }, [bannerConfig.show]);
+  }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Don't render anything if fully online
-  if (!bannerConfig.show) return null;
-
+  // Always render the Animated.View so collapse animation plays correctly.
+  // When config is null (ONLINE), the view just collapses to 0 height.
   return (
     <Animated.View
       style={[
         styles.banner,
-        {
-          transform: [{ translateY: slideAnim }],
-          backgroundColor: bannerConfig.backgroundColor,
-          borderBottomColor: bannerConfig.borderColor,
-        },
+        { height: heightAnim, backgroundColor: config?.bg ?? 'transparent' },
       ]}
     >
-      <Text style={[styles.text, { color: bannerConfig.textColor }]}>
-        {bannerConfig.text}
-      </Text>
+      {config ? (
+        <Text style={[styles.text, { color: config.fg }]} numberOfLines={1}>
+          {config.msg}
+        </Text>
+      ) : null}
     </Animated.View>
   );
 }
 
 const styles = StyleSheet.create({
   banner: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    zIndex: 100,
-    borderBottomWidth: 1,
-    paddingVertical: 8,
-    alignItems: 'center',
+    justifyContent: 'center',
+    alignItems:     'center',
+    overflow:       'hidden',
+    paddingHorizontal: 12,
   },
   text: {
-    fontSize: 12,
+    fontSize:   typography.fontSize.xs,
     fontFamily: 'Courier New',
-    letterSpacing: 0.5,
+    letterSpacing: 0.2,
   },
 });
