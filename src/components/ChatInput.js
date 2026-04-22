@@ -1,35 +1,8 @@
-// src/components/ChatInput.js
-//
-// CHANGE: Accepts `mode` (NetworkMode enum) instead of `isOnline` boolean.
-// Placeholder text and bottom label reflect the current mode.
-
-import React, { useState }       from 'react';
-import {
-  View, TextInput, TouchableOpacity,
-  Text, StyleSheet, ActivityIndicator,
-} from 'react-native';
-import { NetworkMode }           from '../hooks/useNetwork';
+import React, { useState } from 'react';
+import { View, TextInput, TouchableOpacity, Text, StyleSheet, ActivityIndicator } from 'react-native';
 import { colors, spacing, radius, typography } from '../config/theme';
 
-const PLACEHOLDER = {
-  [NetworkMode.ONLINE]:       'Ask anything about the manual…',
-  [NetworkMode.LAN_ONLY]:     'Search manual sections (no AI)…',
-  [NetworkMode.DEEP_OFFLINE]: 'Search local database…',
-};
-
-const MODE_LABEL = {
-  [NetworkMode.ONLINE]:       '● online · AI-powered',
-  [NetworkMode.LAN_ONLY]:     '◑ LAN · retrieval only',
-  [NetworkMode.DEEP_OFFLINE]: '○ offline · local database',
-};
-
-const MODE_LABEL_COLOR = {
-  [NetworkMode.ONLINE]:       colors.text3,
-  [NetworkMode.LAN_ONLY]:     colors.accentText,
-  [NetworkMode.DEEP_OFFLINE]: colors.error,
-};
-
-export function ChatInput({ onSend, disabled, mode = NetworkMode.ONLINE, statusText }) {
+export function ChatInput({ onSend, disabled, isOnline, statusText }) {
   const [text, setText] = useState('');
 
   const handleSend = () => {
@@ -41,7 +14,7 @@ export function ChatInput({ onSend, disabled, mode = NetworkMode.ONLINE, statusT
 
   return (
     <View style={styles.wrapper}>
-      {/* Status row — shown while streaming / searching */}
+      {/* Status text (searching / streaming indicator) */}
       {statusText ? (
         <View style={styles.statusRow}>
           <ActivityIndicator size="small" color={colors.accent} />
@@ -54,7 +27,7 @@ export function ChatInput({ onSend, disabled, mode = NetworkMode.ONLINE, statusT
           style={styles.input}
           value={text}
           onChangeText={setText}
-          placeholder={PLACEHOLDER[mode]}
+          placeholder={isOnline ? 'Ask about the manual…' : 'Search manual sections…'}
           placeholderTextColor={colors.text3}
           multiline
           maxLength={500}
@@ -71,9 +44,9 @@ export function ChatInput({ onSend, disabled, mode = NetworkMode.ONLINE, statusT
         </TouchableOpacity>
       </View>
 
-      {/* Mode label — bottom of input area */}
-      <Text style={[styles.modeLabel, { color: MODE_LABEL_COLOR[mode] }]}>
-        {MODE_LABEL[mode]}
+      {/* Online / offline mode indicator */}
+      <Text style={styles.modeLabel}>
+        {isOnline ? '● online · AI-powered' : '○ offline · retrieval only'}
       </Text>
     </View>
   );
@@ -81,32 +54,32 @@ export function ChatInput({ onSend, disabled, mode = NetworkMode.ONLINE, statusT
 
 const styles = StyleSheet.create({
   wrapper: {
-    backgroundColor:   colors.bg2,
-    borderTopWidth:    1,
-    borderTopColor:    colors.border,
+    backgroundColor: colors.bg2,
+    borderTopWidth:  1,
+    borderTopColor:  colors.border,
     paddingHorizontal: spacing.lg,
-    paddingTop:        spacing.sm,
-    paddingBottom:     spacing.lg,
+    paddingTop:      spacing.sm,
+    paddingBottom:   spacing.lg,
   },
   statusRow: {
-    flexDirection: 'row',
-    alignItems:    'center',
-    gap:           spacing.sm,
-    marginBottom:  spacing.xs,
+    flexDirection:  'row',
+    alignItems:     'center',
+    gap:            spacing.sm,
+    marginBottom:   spacing.xs,
   },
   statusText: { color: colors.text2, fontSize: typography.fontSize.sm },
   row:        { flexDirection: 'row', alignItems: 'flex-end', gap: spacing.sm },
   input: {
-    flex:              1,
-    backgroundColor:   colors.bg3,
-    borderWidth:       1,
-    borderColor:       colors.border,
-    borderRadius:      radius.lg,
+    flex:            1,
+    backgroundColor: colors.bg3,
+    borderWidth:     1,
+    borderColor:     colors.border,
+    borderRadius:    radius.lg,
     paddingHorizontal: spacing.md,
-    paddingVertical:   spacing.sm,
-    color:             colors.text0,
-    fontSize:          typography.fontSize.md,
-    maxHeight:         120,
+    paddingVertical: spacing.sm,
+    color:           colors.text0,
+    fontSize:        typography.fontSize.md,
+    maxHeight:       120,
   },
   sendBtn: {
     width:           40,
@@ -121,6 +94,7 @@ const styles = StyleSheet.create({
   modeLabel: {
     marginTop:  spacing.xs,
     fontSize:   typography.fontSize.xs,
+    color:      colors.text3,
     fontFamily: 'Courier New',
   },
 });
