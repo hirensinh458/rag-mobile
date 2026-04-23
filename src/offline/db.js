@@ -3,17 +3,26 @@
 // Local SQLite database for offline chunk storage and sync metadata.
 // Uses expo-sqlite v2 (async API, SDK 50+).
 //
+// CHANGES:
+//   - FTS5 table now indexes `parent_content` in addition to `content`
+//     so broader context is searchable offline (fixes "only 3 chunks" bug)
+//   - `replaceAllChunks` stores bbox, page_width, page_height, section_path
+//     from the enriched /kb/export response
+//   - `searchChunks` passes parent_content to FTS5 match, returns bbox/section_path
+//   - Added `isPdfAvailableLocally(filename)` helper for OfflineChunkCard
+//
 // TABLES:
 //   chunks     — full-text searchable via FTS5 virtual table
 //   sync_meta  — key/value store for sync state (last_synced, etag, etc.)
 //
-// FTS5 gives us SQLite's built-in full-text search (BM25 ranking built in).
-// No need to implement BM25 manually — SQLite does it for free.
+// NOTE: The FTS5 schema changed (added parent_content column).
+//       On first launch after this update the table is dropped and recreated
+//       automatically. A fresh sync is required to repopulate.
 //
-// REQUIRES: expo-sqlite (~15.1.2)
-//   npx expo install expo-sqlite
+// REQUIRES: expo-sqlite (~16.x)
 
-import * as SQLite from 'expo-sqlite';
+import * as SQLite     from 'expo-sqlite';
+import * as FileSystem from 'expo-file-system/legacy';
 
 // ─────────────────────────────────────────────────────────────
 // DB SINGLETON
@@ -30,22 +39,31 @@ async function getDb() {
 
   await _db.execAsync(`
     CREATE TABLE IF NOT EXISTS chunks (
-      id            TEXT    PRIMARY KEY,
-      source        TEXT    NOT NULL DEFAULT '',
-      content       TEXT    NOT NULL DEFAULT '',
-      parent_content TEXT   NOT NULL DEFAULT '',
-      page          INTEGER NOT NULL DEFAULT 0,
-      chunk_type    TEXT    NOT NULL DEFAULT 'text',
-      score         REAL    NOT NULL DEFAULT 0,
-      synced_at     INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+      id             TEXT    PRIMARY KEY,
+      source         TEXT    NOT NULL DEFAULT '',
+      content        TEXT    NOT NULL DEFAULT '',
+      parent_content TEXT    NOT NULL DEFAULT '',
+      page           INTEGER NOT NULL DEFAULT 0,
+      chunk_type     TEXT    NOT NULL DEFAULT 'text',
+      score          REAL    NOT NULL DEFAULT 0,
+      section_path   TEXT    NOT NULL DEFAULT '',
+      heading        TEXT    NOT NULL DEFAULT '',
+      bbox           TEXT    DEFAULT NULL,
+      page_width     REAL    DEFAULT NULL,
+      page_height    REAL    DEFAULT NULL,
+      synced_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
     );
 
-    -- FTS5 virtual table mirrors 'chunks' for full-text search
-    -- content='' means FTS5 stores its own copy (no external content table race)
+    -- FTS5 virtual table — indexes BOTH content and parent_content
+    -- so broader context is searchable in deep_offline mode.
+    -- content='' means FTS5 stores its own copy (no external content race).
+    -- IMPORTANT: If you change this schema, drop and recreate the table,
+    -- then trigger a fresh sync.
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-      id         UNINDEXED,
+      id             UNINDEXED,
       content,
-      source     UNINDEXED,
+      parent_content,
+      source         UNINDEXED,
       tokenize = 'porter unicode61'
     );
 
@@ -65,10 +83,12 @@ async function getDb() {
 
 /**
  * Replace ALL stored chunks with a fresh batch from the server.
- * Called by syncQueue.syncFromServer() after a successful /kb/export fetch.
+ * Called by syncQueue / useOfflineSearch after a successful /kb/export fetch.
  *
  * Uses a transaction so the wipe + insert is atomic — the app never
  * sees a half-populated database.
+ *
+ * Stores the new enriched fields: bbox, page_width, page_height, section_path.
  */
 export async function replaceAllChunks(chunks) {
   const db = await getDb();
@@ -79,24 +99,34 @@ export async function replaceAllChunks(chunks) {
 
     for (const c of chunks) {
       const id = c.id || `${c.source}_${c.page || 0}_${Math.random().toString(36).slice(2)}`;
+
+      // Serialize bbox array as JSON string (SQLite has no array type)
+      const bboxJson = Array.isArray(c.bbox) ? JSON.stringify(c.bbox) : null;
+
       await db.runAsync(
         `INSERT OR REPLACE INTO chunks
-           (id, source, content, parent_content, page, chunk_type)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+           (id, source, content, parent_content, page, chunk_type,
+            section_path, heading, bbox, page_width, page_height)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
-          c.source        || '',
-          c.content       || '',
+          c.source         || '',
+          c.content        || '',
           c.parent_content || c.content || '',
-          c.page          || 0,
-          c.chunk_type    || 'text',
+          c.page           ?? 0,
+          c.chunk_type     || 'text',
+          c.section_path   || '',
+          c.heading        || '',
+          bboxJson,
+          c.page_width     ?? null,
+          c.page_height    ?? null,
         ],
       );
 
-      // Mirror into FTS5 for full-text search
+      // Mirror into FTS5 for full-text search — index both content and parent_content
       await db.runAsync(
-        'INSERT INTO chunks_fts (id, content, source) VALUES (?, ?, ?)',
-        [id, c.content || '', c.source || ''],
+        'INSERT INTO chunks_fts (id, content, parent_content, source) VALUES (?, ?, ?, ?)',
+        [id, c.content || '', c.parent_content || c.content || '', c.source || ''],
       );
     }
   });
@@ -108,6 +138,9 @@ export async function replaceAllChunks(chunks) {
  * Full-text search using SQLite's built-in FTS5 BM25 ranking.
  * Returns up to `topK` chunks sorted by relevance (best first).
  *
+ * Matches against BOTH content (child chunk) and parent_content (broader context)
+ * so vocabulary-sparse child chunks still surface relevant parent passages.
+ *
  * The porter stemmer means "engine" matches "engines", "engineered", etc.
  */
 export async function searchChunks(query, topK = 5) {
@@ -115,7 +148,7 @@ export async function searchChunks(query, topK = 5) {
 
   const db = await getDb();
 
-  // FTS5 match syntax: wrap each word to avoid operator errors
+  // FTS5 match syntax: quote each word to avoid operator errors
   const ftsQuery = query
     .trim()
     .split(/\s+/)
@@ -132,6 +165,11 @@ export async function searchChunks(query, topK = 5) {
          c.parent_content,
          c.page,
          c.chunk_type,
+         c.section_path,
+         c.heading,
+         c.bbox,
+         c.page_width,
+         c.page_height,
          bm25(chunks_fts) AS bm25_score
        FROM chunks_fts
        JOIN chunks c ON c.id = chunks_fts.id
@@ -141,21 +179,27 @@ export async function searchChunks(query, topK = 5) {
       [ftsQuery, topK],
     );
 
-    // Normalise scores to [0, 1] range, higher = better
-    // SQLite's bm25() returns negative values (more negative = better match)
     if (rows.length === 0) return [];
 
+    // Normalise scores to [0, 1] range, higher = better
+    // SQLite's bm25() returns negative values (more negative = better match)
     const rawScores = rows.map(r => r.bm25_score);
-    const minScore  = Math.min(...rawScores); // most negative = best
+    const minScore  = Math.min(...rawScores);
     const maxScore  = Math.max(...rawScores);
     const range     = maxScore - minScore || 1;
 
     return rows.map(r => ({
       id:             r.id,
       source:         r.source,
-      content:        r.parent_content || r.content, // show readable parent passage
+      content:        r.parent_content || r.content,  // prefer broader context for display
       page:           r.page,
       chunk_type:     r.chunk_type,
+      section_path:   r.section_path || '',
+      heading:        r.heading      || '',
+      // Parse bbox back from JSON string
+      bbox:           r.bbox ? JSON.parse(r.bbox) : null,
+      page_width:     r.page_width  ?? null,
+      page_height:    r.page_height ?? null,
       score:          parseFloat(((maxScore - r.bm25_score) / range).toFixed(4)),
     }));
   } catch (e) {
@@ -171,17 +215,38 @@ async function fallbackSearch(query, topK) {
   const db      = await getDb();
   const pattern = `%${query.trim()}%`;
   const rows    = await db.getAllAsync(
-    `SELECT id, source, content, parent_content, page, chunk_type, 1.0 AS score
+    `SELECT id, source, content, parent_content, page, chunk_type,
+            section_path, heading, bbox, page_width, page_height,
+            1.0 AS score
      FROM chunks
-     WHERE content LIKE ? OR source LIKE ?
+     WHERE content LIKE ? OR parent_content LIKE ? OR source LIKE ?
      LIMIT ?`,
-    [pattern, pattern, topK],
+    [pattern, pattern, pattern, topK],
   );
   return rows.map(r => ({
     ...r,
-    content: r.parent_content || r.content,
-    score:   r.score,
+    content:  r.parent_content || r.content,
+    bbox:     r.bbox ? JSON.parse(r.bbox) : null,
+    score:    r.score,
   }));
+}
+
+/**
+ * Check whether a PDF file has been downloaded locally during sync.
+ * Used by OfflineChunkCard to conditionally show the "Open in manual" button.
+ *
+ * @param {string} filename — e.g. "engine_manual.pdf"
+ * @returns {Promise<boolean>}
+ */
+export async function isPdfAvailableLocally(filename) {
+  if (!filename) return false;
+  try {
+    const path = `${FileSystem.documentDirectory}pdfs/${filename}`;
+    const info = await FileSystem.getInfoAsync(path);
+    return info.exists;
+  } catch {
+    return false;
+  }
 }
 
 /** Total number of locally stored chunks */
@@ -222,7 +287,7 @@ export async function setSyncMeta(key, value) {
 }
 
 export async function getAllSyncMeta() {
-  const db  = await getDb();
+  const db   = await getDb();
   const rows = await db.getAllAsync('SELECT key, value FROM sync_meta;');
   return Object.fromEntries(rows.map(r => [r.key, r.value]));
 }

@@ -1,9 +1,12 @@
 // src/api/client.js
 //
-// CHANGE: getBaseUrl() now reads the user-saved server URL from AsyncStorage
-// first, falling back to Config.API_BASE_URL (env variable / default emulator IP).
-// Previously, the SettingsScreen saved the URL to AsyncStorage but nothing
-// ever read it back — it was silently ignored.
+// CHANGE: apiFetch() now accepts an optional `activeUrl` as the second argument.
+// When provided it is used directly, bypassing the AsyncStorage lookup.
+// This lets useChat (and other callers) thread the URL from useNetwork.activeUrl
+// without re-reading storage on every request.
+//
+// The old signature apiFetch(path, options) still works — if the second arg
+// is a plain object (options) the legacy behaviour is preserved.
 
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Config }   from '../config';
@@ -23,8 +26,14 @@ let _cachedUrl = null;
 
 export async function getBaseUrl() {
   if (_cachedUrl) return _cachedUrl;
-  const saved = await AsyncStorage.getItem('server_url');
-  _cachedUrl  = (saved && saved.trim()) ? saved.trim() : Config.API_BASE_URL;
+  // Prefer local_url (set by SettingsScreen new fields); fall back to legacy server_url
+  const local  = await AsyncStorage.getItem('local_url');
+  const legacy = await AsyncStorage.getItem('server_url');
+  _cachedUrl = (local && local.trim())
+    ? local.trim()
+    : (legacy && legacy.trim())
+      ? legacy.trim()
+      : Config.API_BASE_URL;
   return _cachedUrl;
 }
 
@@ -34,17 +43,37 @@ export function invalidateUrlCache() {
   _cachedUrl = null;
 }
 
-export async function apiFetch(path, options = {}) {
-  const base       = await getBaseUrl();
+/**
+ * apiFetch(path, activeUrl?, options?)
+ *
+ * Overloads:
+ *   apiFetch('/chat/offline', options)                  — legacy, reads base from storage
+ *   apiFetch('/chat/offline', activeUrl, options)       — new, uses activeUrl directly
+ *   apiFetch('/chat/offline', activeUrl)                — new, no extra options
+ */
+export async function apiFetch(path, activeUrlOrOptions, options = {}) {
+  let base;
+  let opts;
+
+  if (typeof activeUrlOrOptions === 'string') {
+    // New signature: second arg is the active URL
+    base = activeUrlOrOptions || await getBaseUrl();
+    opts = options;
+  } else {
+    // Legacy signature: second arg is the options object
+    base = await getBaseUrl();
+    opts = activeUrlOrOptions || {};
+  }
+
   const url        = `${base}${path}`;
   const controller = new AbortController();
   const timeout    = setTimeout(() => controller.abort(), 30_000);
 
   try {
     const res = await fetch(url, {
-      ...options,
+      ...opts,
       signal:  controller.signal,
-      headers: { 'Content-Type': 'application/json', ...options.headers },
+      headers: { 'Content-Type': 'application/json', ...opts.headers },
     });
 
     if (!res.ok) {

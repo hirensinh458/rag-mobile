@@ -1,11 +1,19 @@
 // src/components/PdfViewer.js
+//
+// CHANGES:
+//   - Now accepts `mode` and `serverUrl` props from ChatScreen.
+//     Previously it always used Config.API_BASE_URL (broke in Mode 3).
+//   - In deep_offline mode, resolves source from the local PDF cache
+//     (FileSystem.documentDirectory/pdfs/) instead of making a network request.
+//   - Shows a clear error if the PDF hasn't been synced yet in deep_offline.
+//   - serverUrl is now explicit (not re-read from AsyncStorage on every open).
+
 import React, { useState, useEffect } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   ActivityIndicator, Modal, Platform, Linking,
 } from 'react-native';
 import * as FileSystem from 'expo-file-system/legacy';   // ← legacy import
-import { Config }      from '../config';
 import { colors, spacing, radius, typography, minTapTarget } from '../config/theme';
 
 // PDF_DIR must match pdfSync.js
@@ -18,6 +26,9 @@ try { Pdf = require('react-native-pdf').default; } catch { /* needs EAS build */
 /**
  * Full-screen PDF viewer.
  *
+ * Mode 1/2 (online or intranet): streams PDF from serverUrl/pdfs/<filename>
+ * Mode 3 (deep_offline):         reads from local FileSystem cache
+ *
  * Before EAS build (react-native-pdf not available):
  *   → auto-opens the PDF in the device browser/PDF app via HTTP URL
  *
@@ -25,51 +36,85 @@ try { Pdf = require('react-native-pdf').default; } catch { /* needs EAS build */
  *   → renders in-app with react-native-pdf, jumping to the correct page
  *
  * Props:
- *   filename  string  — e.g. "engine_manual.pdf"
- *   page      number  — page to jump to (1-indexed)
- *   bbox      array   — reserved for future highlight
- *   onClose   fn      — dismiss callback
+ *   filename   string  — e.g. "engine_manual.pdf"
+ *   page       number  — page to jump to (1-indexed)
+ *   bbox       array   — reserved for future highlight [x0,y0,x1,y1]
+ *   serverUrl  string  — base server URL from ChatScreen (e.g. 'http://192.168.1.X:8001')
+ *   mode       string  — 'full_online' | 'intranet_only' | 'deep_offline'
+ *   onClose    fn      — dismiss callback
  */
-export function PdfViewer({ filename, page = 1, bbox, onClose }) {
+export function PdfViewer({ filename, page = 1, bbox, serverUrl = '', mode = 'full_online', onClose }) {
   const [status,     setStatus]     = useState('loading');  // 'loading' | 'ready' | 'error' | 'opened'
   const [source,     setSource]     = useState(null);
   const [totalPages, setTotalPages] = useState(0);
   const [curPage,    setCurPage]    = useState(page);
   const [errorMsg,   setErrorMsg]   = useState('');
 
-  // Build the server URL once (always valid in Mode 1 + Mode 2)
-  const serverUrl = `${Config.API_BASE_URL}/pdfs/${encodeURIComponent(filename)}`;
-
   useEffect(() => {
-    if (Pdf) {
-      // Native viewer path — resolve whether to use local cache or server
-      (async () => {
+    async function resolveSource() {
+      if (mode === 'deep_offline') {
+        // Deep offline — must use local file
+        const localPath = `${PDF_DIR}${filename}`;
         try {
-          const localPath = PDF_DIR + filename;
           const info = await FileSystem.getInfoAsync(localPath);
-          setSource(
-            info.exists
-              ? { uri: localPath,   cache: false }
-              : { uri: serverUrl,   cache: true  }
-          );
-          setStatus('ready');
+          if (info.exists) {
+            setSource({ uri: localPath, cache: false });
+            setStatus(Pdf ? 'ready' : 'opening');
+            if (!Pdf) {
+              // No native viewer — open via Linking (file:// on device)
+              Linking.openURL(localPath)
+                .then(() => setStatus('opened'))
+                .catch(e => { setErrorMsg(e.message || 'Could not open file'); setStatus('error'); });
+            }
+          } else {
+            setErrorMsg('PDF not synced. Connect to the server and tap "Sync from Server" in Settings.');
+            setStatus('error');
+          }
         } catch (e) {
-          // If file-system check fails just use server URL
-          setSource({ uri: serverUrl, cache: true });
-          setStatus('ready');
-        }
-      })();
-    } else {
-      // No native module — open in browser immediately, then show "opened" state
-      setStatus('opening');
-      Linking.openURL(serverUrl)
-        .then(() => setStatus('opened'))
-        .catch((e) => {
-          setErrorMsg(e.message || 'Could not open URL');
+          setErrorMsg(`Could not check local file: ${e.message}`);
           setStatus('error');
-        });
+        }
+      } else {
+        // Mode 1 or 2 — use network URL
+        if (!serverUrl) {
+          setErrorMsg('Server URL not configured. Check Settings.');
+          setStatus('error');
+          return;
+        }
+
+        if (Pdf) {
+          // Native viewer — try local cache first, fall back to network
+          try {
+            const localPath = `${PDF_DIR}${filename}`;
+            const info = await FileSystem.getInfoAsync(localPath);
+            setSource(
+              info.exists
+                ? { uri: localPath,                                            cache: false }
+                : { uri: `${serverUrl}/pdfs/${encodeURIComponent(filename)}`, cache: true  }
+            );
+            setStatus('ready');
+          } catch {
+            setSource({ uri: `${serverUrl}/pdfs/${encodeURIComponent(filename)}`, cache: true });
+            setStatus('ready');
+          }
+        } else {
+          // No native module — open in browser
+          const networkUrl = `${serverUrl}/pdfs/${encodeURIComponent(filename)}`;
+          setStatus('opening');
+          Linking.openURL(networkUrl)
+            .then(() => setStatus('opened'))
+            .catch(e => { setErrorMsg(e.message || 'Could not open URL'); setStatus('error'); });
+        }
+      }
     }
-  }, [filename, serverUrl]);
+
+    resolveSource();
+  }, [filename, mode, serverUrl]);
+
+  // Convenience: the URL to show in the "Direct URL" box (only for network modes)
+  const networkUrl = serverUrl
+    ? `${serverUrl}/pdfs/${encodeURIComponent(filename)}`
+    : '';
 
   // ── No native PDF module: show status + manual link ─────────────────────
   if (!Pdf) {
@@ -82,7 +127,7 @@ export function PdfViewer({ filename, page = 1, bbox, onClose }) {
             {status === 'opening' && (
               <>
                 <ActivityIndicator size="large" color={colors.accent} />
-                <Text style={styles.statusText}>Opening PDF in browser…</Text>
+                <Text style={styles.statusText}>Opening PDF…</Text>
                 <Text style={styles.hintText}>{filename}</Text>
               </>
             )}
@@ -90,17 +135,20 @@ export function PdfViewer({ filename, page = 1, bbox, onClose }) {
             {status === 'opened' && (
               <>
                 <Text style={styles.bigIcon}>✅</Text>
-                <Text style={styles.statusText}>PDF opened in browser</Text>
+                <Text style={styles.statusText}>PDF opened</Text>
                 <Text style={styles.hintText}>
-                  Page {page} — scroll to find it manually.{'\n'}
-                  In-app viewer available after EAS build.
+                  {mode === 'deep_offline'
+                    ? 'Opened from local storage.'
+                    : `Page ${page} — scroll to find it manually.\nIn-app viewer available after EAS build.`}
                 </Text>
-                <TouchableOpacity
-                  style={styles.secondaryBtn}
-                  onPress={() => Linking.openURL(serverUrl)}
-                >
-                  <Text style={styles.secondaryBtnText}>Open again →</Text>
-                </TouchableOpacity>
+                {networkUrl ? (
+                  <TouchableOpacity
+                    style={styles.secondaryBtn}
+                    onPress={() => Linking.openURL(networkUrl)}
+                  >
+                    <Text style={styles.secondaryBtnText}>Open again →</Text>
+                  </TouchableOpacity>
+                ) : null}
               </>
             )}
 
@@ -108,24 +156,26 @@ export function PdfViewer({ filename, page = 1, bbox, onClose }) {
               <>
                 <Text style={styles.bigIcon}>⚠️</Text>
                 <Text style={styles.errorText}>
-                  Could not open PDF.{'\n'}
-                  Make sure the server is reachable.
+                  {errorMsg || 'Could not open PDF.'}
                 </Text>
-                {errorMsg ? <Text style={styles.hintText}>{errorMsg}</Text> : null}
-                <TouchableOpacity
-                  style={styles.primaryBtn}
-                  onPress={() => Linking.openURL(serverUrl).catch(() => {})}
-                >
-                  <Text style={styles.primaryBtnText}>Retry</Text>
-                </TouchableOpacity>
+                {networkUrl ? (
+                  <TouchableOpacity
+                    style={styles.primaryBtn}
+                    onPress={() => Linking.openURL(networkUrl).catch(() => {})}
+                  >
+                    <Text style={styles.primaryBtnText}>Retry</Text>
+                  </TouchableOpacity>
+                ) : null}
               </>
             )}
 
-            {/* Always show manual URL as last resort */}
-            <View style={styles.urlBox}>
-              <Text style={styles.urlLabel}>Direct URL:</Text>
-              <Text style={styles.urlText} numberOfLines={2}>{serverUrl}</Text>
-            </View>
+            {/* Always show URL as last resort — only in network modes */}
+            {networkUrl ? (
+              <View style={styles.urlBox}>
+                <Text style={styles.urlLabel}>Direct URL:</Text>
+                <Text style={styles.urlText} numberOfLines={2}>{networkUrl}</Text>
+              </View>
+            ) : null}
           </View>
         </View>
       </Modal>
@@ -249,8 +299,8 @@ const styles = StyleSheet.create({
     padding:           spacing.xl,
     gap:               spacing.md,
   },
-  bigIcon:     { fontSize: 52 },
-  statusText:  {
+  bigIcon:    { fontSize: 52 },
+  statusText: {
     fontSize:   typography.fontSize.lg,
     color:      colors.text0,
     textAlign:  'center',

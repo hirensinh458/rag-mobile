@@ -1,9 +1,19 @@
 // src/hooks/useChat.js
+//
+// CHANGE: useChat() now accepts an `activeUrl` parameter (from useNetwork.activeUrl)
+// and threads it through to all API calls so the correct server is used.
+// Mode 3 topK raised from 5 → 10 to compensate for FTS5 vocabulary sparsity.
+// Mode 3 normalises bbox field from synced chunks (null if not present).
+
 import { useState, useCallback, useRef } from 'react';
 import { streamChat, fetchOfflineResponse, clearSession } from '../api/chat';
 import { searchChunks } from '../offline/db';  // Mode 3: local SQLite FTS
 
-export function useChat() {
+/**
+ * @param {string} activeUrl — the currently working server URL from useNetwork.
+ *                             Empty string when deep_offline.
+ */
+export function useChat(activeUrl = '') {
   const [messages,   setMessages]   = useState([]);
   const [streaming,  setStreaming]  = useState(false);
   const [statusText, setStatusText] = useState('');
@@ -35,17 +45,18 @@ export function useChat() {
       setStatusText('Searching local database…');
 
       try {
-        const rawChunks = await searchChunks(question, 5);
-        // Normalize to the same shape as server offline chunks
-        const chunks = rawChunks.map(c => ({
+        // Request 10 chunks — FTS5 on short snippets may return fewer results
+        // than requested; taking 10 and slicing to 5 gives better coverage
+        const rawChunks = await searchChunks(question, 10);
+        const chunks = rawChunks.slice(0, 5).map(c => ({
           source:       c.source,
           page:         c.page,
           content:      c.parent_content || c.content,
           score:        c.score || 0,
           chunk_type:   c.chunk_type || 'text',
-          section_path: '',
-          heading:      '',
-          bbox:         null,
+          section_path: c.section_path || '',
+          heading:      c.heading      || '',
+          bbox:         c.bbox         || null,
         }));
         setMessages(prev => prev.map(m =>
           m.id === assistantId ? { ...m, offline_chunks: chunks } : m
@@ -73,7 +84,7 @@ export function useChat() {
       setStatusText('Searching manual sections…');
 
       try {
-        const result = await fetchOfflineResponse(question, pinnedFile);
+        const result = await fetchOfflineResponse(question, pinnedFile, activeUrl);
         setMessages(prev => prev.map(m =>
           m.id === assistantId
             ? { ...m, offline_chunks: result.chunks || [] }
@@ -151,10 +162,10 @@ export function useChat() {
         setStreaming(false);
         setStatusText('');
       },
-    });
+    }, activeUrl);  // thread activeUrl to SSE
 
     cancelRef.current = cancel;
-  }, [streaming]);
+  }, [streaming, activeUrl]);
 
   const cancel = useCallback(() => {
     cancelRef.current?.();
@@ -164,9 +175,9 @@ export function useChat() {
 
   const clear = useCallback(async () => {
     cancelRef.current?.();
-    try { await clearSession(); } catch { /* ignore if offline */ }
+    try { await clearSession('default', activeUrl); } catch { /* ignore if offline */ }
     setMessages([]);
-  }, []);
+  }, [activeUrl]);
 
   return { messages, streaming, statusText, send, clear, cancel };
 }

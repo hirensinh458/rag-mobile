@@ -1,6 +1,14 @@
 // src/components/MessageBubble.js
+//
+// CHANGES:
+//   - Citation chips are now <TouchableOpacity> elements that call onOpenPdf
+//     (previously they were static <View>/<Text> chips with no interaction)
+//   - Page guard changed from `c.page && ...` to `c.page != null && ...`
+//     to handle page === 0 correctly (avoids "Text in View" crash)
+//   - onOpenPdf is called with (source, page, bbox) — bbox from enriched citations
+
 import React from 'react';
-import { View, Text, StyleSheet, ActivityIndicator } from 'react-native';
+import { View, Text, StyleSheet, ActivityIndicator, TouchableOpacity } from 'react-native';
 import Markdown from 'react-native-markdown-display';
 import { OfflineChunkCard } from './OfflineChunkCard';
 import { colors, spacing, radius, typography } from '../config/theme';
@@ -24,6 +32,82 @@ const markdownStyles = {
     paddingLeft: 10, marginLeft: 0, backgroundColor: colors.bg3,
   },
 };
+
+/**
+ * Tappable citation chips — each chip opens the PDF viewer at the cited page.
+ *
+ * Critical: use `c.page != null` not `c.page` — page can be 0 (falsy) and
+ * rendering raw numeric 0 outside <Text> crashes React Native.
+ */
+function CitationChips({ citations, onOpenPdf }) {
+  if (!citations || citations.length === 0) return null;
+
+  return (
+    <View style={chipStyles.row}>
+      {citations.map((c, i) => (
+        <TouchableOpacity
+          key={i}
+          style={chipStyles.chip}
+          onPress={() => onOpenPdf && onOpenPdf(c.source, c.page != null ? c.page : 1, c.bbox || null)}
+          activeOpacity={0.7}
+        >
+          <Text style={chipStyles.icon}>📄</Text>
+          <View style={chipStyles.info}>
+            <Text style={chipStyles.filename} numberOfLines={1}>
+              {c.source}
+            </Text>
+            {c.page != null && (
+              <Text style={chipStyles.page}>
+                {'p. ' + c.page}
+                {c.heading ? '  ·  ' + c.heading : ''}
+              </Text>
+            )}
+          </View>
+          <Text style={chipStyles.arrow}>›</Text>
+        </TouchableOpacity>
+      ))}
+    </View>
+  );
+}
+
+const chipStyles = StyleSheet.create({
+  row: {
+    flexDirection: 'row',
+    flexWrap:      'wrap',
+    gap:           spacing.xs,
+    marginTop:     spacing.md,
+  },
+  chip: {
+    flexDirection:     'row',
+    alignItems:        'center',
+    backgroundColor:   colors.bg3,
+    borderRadius:      radius.md,
+    borderWidth:       1,
+    borderColor:       colors.borderMd,
+    paddingHorizontal: spacing.sm,
+    paddingVertical:   6,
+    gap:               spacing.xs,
+    maxWidth:          '100%',
+  },
+  icon:     { fontSize: 12 },
+  info:     { flex: 1, minWidth: 0 },
+  filename: {
+    color:      colors.teal,
+    fontSize:   typography.fontSize.xs,
+    fontFamily: typography.fontMono,
+  },
+  page: {
+    color:      colors.text3,
+    fontSize:   typography.fontSize.xs,
+    fontFamily: typography.fontMono,
+    marginTop:  1,
+  },
+  arrow: {
+    color:    colors.accentText,
+    fontSize: 16,
+    fontWeight: '600',
+  },
+});
 
 /**
  * Props:
@@ -71,7 +155,7 @@ export function MessageBubble({ message, onOpenPdf }) {
             <OfflineChunkCard
               key={chunk.id || i}
               chunk={chunk}
-              onOpenPdf={onOpenPdf}   // ← was missing in original — now wired
+              onOpenPdf={onOpenPdf}
             />
           ))}
         </View>
@@ -94,17 +178,9 @@ export function MessageBubble({ message, onOpenPdf }) {
           <ActivityIndicator size="small" color={colors.accent} />
         )}
 
-        {/* Citations */}
+        {/* Tappable citation chips — open PDF viewer at cited page */}
         {!message.streaming && (message.citations || []).length > 0 && (
-          <View style={styles.citations}>
-            {message.citations.map((c, i) => (
-              <View key={i} style={styles.citationChip}>
-                <Text style={styles.citationText} numberOfLines={1}>
-                  📄 {c.source}{c.page ? ` · p${c.page}` : ''}
-                </Text>
-              </View>
-            ))}
-          </View>
+          <CitationChips citations={message.citations} onOpenPdf={onOpenPdf} />
         )}
 
         {/* Token count */}
@@ -191,24 +267,6 @@ const styles = StyleSheet.create({
   emptyText: { color: colors.text3, fontSize: typography.fontSize.sm, paddingVertical: spacing.sm },
   errorText: { color: colors.error, fontSize: typography.fontSize.sm, paddingVertical: spacing.sm },
 
-  // Citations
-  citations:    {
-    flexDirection: 'row', flexWrap: 'wrap',
-    gap: spacing.xs, marginTop: spacing.md,
-  },
-  citationChip: {
-    backgroundColor:   colors.bg3,
-    borderRadius:      radius.full,
-    borderWidth:       1,
-    borderColor:       colors.border,
-    paddingHorizontal: spacing.sm,
-    paddingVertical:   3,
-  },
-  citationText: {
-    color:      colors.accentText,
-    fontSize:   typography.fontSize.xs,
-    fontFamily: typography.fontMono,
-  },
   tokenCount: {
     marginTop:  spacing.sm,
     textAlign:  'right',

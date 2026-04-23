@@ -1,18 +1,32 @@
 // src/screens/ChatScreen.js
+//
+// CHANGES:
+//   - useNetwork() now returns `activeUrl` — threaded to useChat()
+//   - useOfflineSearch(mode, activeUrl) wired here so auto-sync actually runs
+//     (previously the hook was declared but never instantiated in the tree)
+//   - serverUrl loaded from AsyncStorage at mount time and passed to PdfViewer
+//     as an explicit prop (not re-read from storage on every PDF open)
+//   - PdfViewer now receives `mode` and `serverUrl` props
+//   - mode prop passed to OfflineChunkCard via MessageBubble so PDF availability
+//     check knows whether to look locally or use the server
+
 import React, { useRef, useCallback, useState, useEffect } from 'react';
 import {
   View, FlatList, StyleSheet,
   KeyboardAvoidingView, Platform,
   Text, TouchableOpacity,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { useChat }       from '../hooks/useChat';
-import { useNetwork }    from '../hooks/useNetwork';
-import { MessageBubble } from '../components/MessageBubble';
-import { NetworkBanner } from '../components/NetworkBanner';
-import { ChatInput }     from '../components/ChatInput';
-import { PdfViewer }     from '../components/PdfViewer';
+import { useChat }          from '../hooks/useChat';
+import { useNetwork }       from '../hooks/useNetwork';
+import { useOfflineSearch } from '../hooks/useOfflineSearch';
+import { MessageBubble }    from '../components/MessageBubble';
+import { NetworkBanner }    from '../components/NetworkBanner';
+import { ChatInput }        from '../components/ChatInput';
+import { PdfViewer }        from '../components/PdfViewer';
+import { Config }           from '../config';
 import { colors, spacing, typography, radius, minTapTarget } from '../config/theme';
 
 const MODE_CONFIG = {
@@ -22,13 +36,37 @@ const MODE_CONFIG = {
 };
 
 export function ChatScreen() {
-  const { messages, streaming, statusText, send, clear } = useChat();
-  const { serverReachable, serverHasInternet, mode }      = useNetwork();
+  const { mode, activeUrl, serverReachable, serverHasInternet } = useNetwork();
+  const { messages, streaming, statusText, send, clear }        = useChat(activeUrl);
+
+  // Wire auto-sync — MUST be instantiated here so it's active.
+  // Previously this hook was declared but never used in ChatScreen,
+  // meaning auto-sync never fired.
+  const { syncStatus } = useOfflineSearch(mode, activeUrl);
+
   const flatListRef = useRef(null);
   const insets      = useSafeAreaInsets();
 
-  // PDF viewer state lifted here so any chunk card can trigger it
+  // PDF viewer state lifted here so any message or chunk card can trigger it
   const [pdfViewer, setPdfViewer] = useState(null);
+
+  // Load serverUrl once at mount and keep it stable.
+  // PdfViewer gets this as an explicit prop so it never has to re-read storage.
+  const [serverUrl, setServerUrl] = useState('');
+  useEffect(() => {
+    (async () => {
+      const cloud = await AsyncStorage.getItem('cloud_url');
+      const local = await AsyncStorage.getItem('local_url');
+      const legacy = await AsyncStorage.getItem('server_url');
+      // Prefer activeUrl if already resolved; fall back through storage keys
+      const resolved = activeUrl
+        || (cloud && cloud.trim())
+        || (local && local.trim())
+        || (legacy && legacy.trim())
+        || Config.API_BASE_URL;
+      setServerUrl(resolved);
+    })();
+  }, [activeUrl]); // re-resolve when activeUrl changes
 
   const modeConf = MODE_CONFIG[mode] || MODE_CONFIG.full_online;
 
@@ -56,8 +94,8 @@ export function ChatScreen() {
   const keyExtractor = useCallback((m) => String(m.id), []);
 
   const renderItem = useCallback(({ item }) => (
-    <MessageBubble message={item} onOpenPdf={handleOpenPdf} />
-  ), [handleOpenPdf]);
+    <MessageBubble message={item} onOpenPdf={handleOpenPdf} mode={mode} />
+  ), [handleOpenPdf, mode]);
 
   return (
     <View style={styles.root}>
@@ -72,7 +110,9 @@ export function ChatScreen() {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>MarineDoc</Text>
-          <Text style={styles.subtitle}>Ship Manual Assistant</Text>
+          <Text style={styles.subtitle}>
+            {syncStatus.isSyncing ? 'Syncing…' : 'Ship Manual Assistant'}
+          </Text>
         </View>
         <View style={styles.headerRight}>
           <View style={[styles.modeBadge, { borderColor: modeConf.dot + '55' }]}>
@@ -93,13 +133,9 @@ export function ChatScreen() {
 
       {/*
        * KeyboardAvoidingView wraps BOTH the FlatList and ChatInput.
-       * This is the correct pattern — if it only wraps the input,
-       * the keyboard covers the last message.
-       *
        * iOS:     'padding' — pushes everything up by keyboard height
        * Android: 'height'  — shrinks the view height (requires
-       *          android:windowSoftInputMode="adjustResize" in manifest,
-       *          which is already set in your AndroidManifest.xml)
+       *          android:windowSoftInputMode="adjustResize" in manifest)
        */}
       <KeyboardAvoidingView
         style={styles.flex}
@@ -137,6 +173,8 @@ export function ChatScreen() {
           filename={pdfViewer.filename}
           page={pdfViewer.page}
           bbox={pdfViewer.bbox}
+          serverUrl={serverUrl}
+          mode={mode}
           onClose={() => setPdfViewer(null)}
         />
       )}

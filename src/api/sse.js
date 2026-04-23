@@ -1,9 +1,16 @@
-// src/api/sse.js — DEBUG VERSION
+// src/api/sse.js
+//
+// CHANGE: streamSSE() now accepts a `baseUrl` parameter so the active
+// server URL from useNetwork.activeUrl can be used instead of the
+// hardcoded Config.API_BASE_URL. Falls back to Config.API_BASE_URL when
+// not provided (preserves backward compatibility).
+
 import { Config } from '../config';
 
-export function streamSSE(path, body, onEvent, onDone, onError) {
-  const xhr = new XMLHttpRequest();
-  const url = `${Config.API_BASE_URL}${path}`;
+export function streamSSE(path, body, onEvent, onDone, onError, baseUrl) {
+  const base = baseUrl || Config.API_BASE_URL;
+  const xhr  = new XMLHttpRequest();
+  const url  = `${base}${path}`;
 
   console.log('[SSE] Opening connection to:', url);
 

@@ -1,35 +1,23 @@
 // src/offline/syncQueue.js
 //
-// Sync orchestrator: pulls chunks from the server's /kb/export endpoint
-// and stores them in local SQLite for Mode 3 (deep offline) use.
-//
-// WHEN TO SYNC:
-//   - App comes online after being DEEP_OFFLINE
-//   - User opens SettingsScreen and taps "Sync now"
-//   - Periodic background sync (every SYNC_INTERVAL_MS)
-//   - After a new document is ingested on the server
-//
-// RETRY LOGIC:
-//   - Exponential backoff: 2s → 4s → 8s → 16s → 30s (cap)
-//   - Max 5 attempts per sync trigger
-//   - Gives up gracefully; next poll interval will retry
+// Robust Sync Orchestrator (FIXED VERSION)
+// - Restores original retry + status logic
+// - Uses new apiFetch(activeUrl)
+// - Includes PDF sync
+// - Safe for auto + manual sync triggers
 
-import { getBaseUrl } from '../api/client';
-import {
-  replaceAllChunks,
-  getChunkCount,
-  getSyncMeta,
-  setSyncMeta,
-} from './db';
+import { replaceAllChunks, getChunkCount, getSyncMeta, setSyncMeta } from './db';
 import { syncPdfs } from './pdfSync';
+import { apiFetch } from '../api/client';
+
 // ─────────────────────────────────────────────────────────────
 // CONSTANTS
 // ─────────────────────────────────────────────────────────────
-const SYNC_TIMEOUT_MS = 30_000; // abort if server doesn't respond in 30s
+const SYNC_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 5;
 const BASE_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 30_000;
-const SYNC_INTERVAL_MS = 5 * 60 * 1000; // re-sync every 5 minutes when online
+const SYNC_INTERVAL_MS = 5 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────
 // STATE
@@ -37,9 +25,9 @@ const SYNC_INTERVAL_MS = 5 * 60 * 1000; // re-sync every 5 minutes when online
 let _syncing = false;
 let _retryCount = 0;
 let _retryTimer = null;
-let _onStatusChange = null; // callback: (status) => void
+let _onStatusChange = null;
 
-/** Register a callback to be called when sync status changes */
+/** Register callback for UI updates */
 export function onSyncStatusChange(cb) {
   _onStatusChange = cb;
 }
@@ -53,15 +41,10 @@ function _emit(status) {
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Fetch all chunks from the server's /kb/export endpoint and store locally.
- *
- * This replaces the entire local database with fresh server data.
- * For large KBs (>10k chunks), consider paginating — but for ship manuals
- * (typically <5k chunks) a full replace is fine and simpler.
- *
- * Returns: { success: boolean, chunkCount: number, error?: string }
+ * Full sync from server
+ * @param {string} activeUrl
  */
-export async function syncFromServer() {
+export async function syncFromServer(activeUrl = '') {
   if (_syncing) {
     console.log('[SYNC] Already syncing, skipping');
     return { success: false, error: 'sync_in_progress' };
@@ -71,17 +54,19 @@ export async function syncFromServer() {
   _emit({ syncing: true, phase: 'connecting' });
 
   try {
-    const base = await getBaseUrl();
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), SYNC_TIMEOUT_MS);
 
     let response;
+
     try {
       _emit({ syncing: true, phase: 'fetching' });
-      response = await fetch(`${base}/kb/export`, {
+
+      response = await apiFetch('/kb/export', activeUrl, {
         signal: controller.signal,
         headers: { 'Content-Type': 'application/json' },
       });
+
     } finally {
       clearTimeout(timeout);
     }
@@ -93,16 +78,27 @@ export async function syncFromServer() {
     const data = await response.json();
     const chunks = data.chunks || [];
 
+    // ─────────────────────────────
+    // EMPTY DATA CASE
+    // ─────────────────────────────
     if (chunks.length === 0) {
-      console.log('[SYNC] Server has no chunks — nothing to sync');
-      await setSyncMeta('last_synced', new Date().toISOString());
+      console.log('[SYNC] No chunks on server');
+
+      const now = new Date().toISOString();
+      await setSyncMeta('last_synced', now);
       await setSyncMeta('chunk_count', '0');
+
       _emit({ syncing: false, phase: 'idle', chunkCount: 0 });
       _retryCount = 0;
+
       return { success: true, chunkCount: 0 };
     }
 
+    // ─────────────────────────────
+    // STORE CHUNKS
+    // ─────────────────────────────
     _emit({ syncing: true, phase: 'storing', total: chunks.length });
+
     await replaceAllChunks(chunks);
 
     const now = new Date().toISOString();
@@ -110,30 +106,50 @@ export async function syncFromServer() {
     await setSyncMeta('chunk_count', String(chunks.length));
     await setSyncMeta('server_total', String(data.total || chunks.length));
 
-    console.log(`[SYNC] ✅ Synced ${chunks.length} chunks at ${now}`);
-    _retryCount = 0;
-    _emit({ syncing: false, phase: 'done', chunkCount: chunks.length, lastSynced: now });
+    console.log(`[SYNC] ✅ Synced ${chunks.length} chunks`);
 
-    // 🔽 ADD THIS BLOCK HERE
-    // Sync PDFs in the same pass — non-blocking, errors are logged only
+    // ─────────────────────────────
+    // PDF SYNC (NON-BLOCKING SAFE)
+    // ─────────────────────────────
+    let pdfResult = { synced: [], deleted: [], errors: [] };
+
     try {
-      const pdfResult = await syncPdfs();
-      if (pdfResult.errors.length > 0) {
+      pdfResult = await syncPdfs(activeUrl);
+
+      if (pdfResult.errors?.length) {
         console.warn('[SYNC] PDF errors:', pdfResult.errors);
       }
+
     } catch (e) {
-      console.warn('[SYNC] PDF sync failed (non-blocking):', e.message);
+      console.warn('[SYNC] PDF sync failed:', e.message);
     }
 
-    return { success: true, chunkCount: chunks.length };
-    
+    _retryCount = 0;
+
+    _emit({
+      syncing: false,
+      phase: 'done',
+      chunkCount: chunks.length,
+      lastSynced: now,
+    });
+
+    return {
+      success: true,
+      chunkCount: chunks.length,
+      pdfsSynced: pdfResult.synced.length,
+      pdfsDeleted: pdfResult.deleted.length,
+      errors: pdfResult.errors,
+    };
+
   } catch (err) {
     const isAbort = err.name === 'AbortError';
     const msg = isAbort ? 'Sync timed out' : err.message;
+
     console.warn(`[SYNC] ❌ Failed (attempt ${_retryCount + 1}): ${msg}`);
 
     _emit({ syncing: false, phase: 'error', error: msg });
-    _scheduleRetry();
+
+    _scheduleRetry(activeUrl);
 
     return { success: false, error: msg };
 
@@ -146,9 +162,9 @@ export async function syncFromServer() {
 // RETRY LOGIC
 // ─────────────────────────────────────────────────────────────
 
-function _scheduleRetry() {
+function _scheduleRetry(activeUrl) {
   if (_retryCount >= MAX_RETRIES) {
-    console.log(`[SYNC] Max retries (${MAX_RETRIES}) reached. Giving up until next poll.`);
+    console.log('[SYNC] Max retries reached. Waiting for next trigger.');
     _retryCount = 0;
     return;
   }
@@ -156,11 +172,12 @@ function _scheduleRetry() {
   const delay = Math.min(BASE_BACKOFF_MS * 2 ** _retryCount, MAX_BACKOFF_MS);
   _retryCount++;
 
-  console.log(`[SYNC] Retrying in ${delay / 1000}s (attempt ${_retryCount}/${MAX_RETRIES})`);
+  console.log(`[SYNC] Retrying in ${delay / 1000}s`);
 
   clearTimeout(_retryTimer);
+
   _retryTimer = setTimeout(() => {
-    syncFromServer();
+    syncFromServer(activeUrl);
   }, delay);
 }
 
@@ -168,10 +185,6 @@ function _scheduleRetry() {
 // HELPERS
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Returns true if a sync is needed.
- * Sync if: no local chunks, OR last sync was more than SYNC_INTERVAL_MS ago.
- */
 export async function shouldSync() {
   const localCount = await getChunkCount();
   if (localCount === 0) return true;
@@ -183,7 +196,6 @@ export async function shouldSync() {
   return elapsed > SYNC_INTERVAL_MS;
 }
 
-/** Read current sync metadata for display in the UI */
 export async function getSyncStatus() {
   const lastSynced = await getSyncMeta('last_synced');
   const chunkCount = await getSyncMeta('chunk_count');
@@ -197,7 +209,6 @@ export async function getSyncStatus() {
   };
 }
 
-/** Cancel any pending retry timer */
 export function cancelPendingSync() {
   clearTimeout(_retryTimer);
   _retryCount = 0;

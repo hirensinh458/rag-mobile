@@ -1,4 +1,9 @@
 // src/offline/pdfSync.js
+//
+// CHANGE: syncPdfs() and getLocalPdfUri() now accept an optional `activeUrl`
+// parameter so the correct server URL (from useNetwork.activeUrl) is used
+// instead of the cached Config.API_BASE_URL.
+
 import * as FileSystem from 'expo-file-system/legacy';  // ← legacy import fixes warning
 import { apiFetch }    from '../api/client';
 import { Config }      from '../config';
@@ -29,13 +34,17 @@ export async function getLocalPdfUri(filename) {
  * Sync all PDFs from the server.
  * Downloads any PDFs not cached locally.
  * Removes PDFs no longer on the server.
+ *
+ * @param {string} activeUrl — base URL from useNetwork (optional, falls back to Config)
  */
-export async function syncPdfs() {
+export async function syncPdfs(activeUrl = '') {
   await ensurePdfDir();
+
+  const base = activeUrl || Config.API_BASE_URL;
 
   let serverFiles = [];
   try {
-    const res  = await apiFetch('/documents');
+    const res  = await apiFetch('/documents', activeUrl);
     const data = await res.json();
     serverFiles = (data.files || []).filter(
       f => typeof f === 'string' && f.toLowerCase().endsWith('.pdf')
@@ -55,7 +64,7 @@ export async function syncPdfs() {
 
   for (const filename of serverFiles) {
     if (localSet.has(filename)) continue;
-    const remoteUrl = `${Config.API_BASE_URL}/pdfs/${encodeURIComponent(filename)}`;
+    const remoteUrl = `${base}/pdfs/${encodeURIComponent(filename)}`;
     const localPath = PDF_DIR + filename;
     try {
       const result = await FileSystem.downloadAsync(remoteUrl, localPath);
