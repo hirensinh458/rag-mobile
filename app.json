@@ -10,6 +10,7 @@
       "expo-secure-store",
       "expo-dev-client",
       "expo-sqlite",
+      "./plugins/withSqliteVec",
       [
         "expo-build-properties",
         {

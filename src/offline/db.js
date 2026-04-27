@@ -1,32 +1,32 @@
-// src/offline/db.js
+// src/offline/db.js  — P2 + P3 + P4 full rewrite
 //
-// Local SQLite database for offline chunk storage and sync metadata.
-// Uses expo-sqlite v2 (async API, SDK 50+).
-//
-// CHANGES:
-//   - FTS5 table now indexes `parent_content` in addition to `content`
-//     so broader context is searchable offline (fixes "only 3 chunks" bug)
-//   - `replaceAllChunks` stores bbox, page_width, page_height, section_path
-//     from the enriched /kb/export response
-//   - `searchChunks` passes parent_content to FTS5 match, returns bbox/section_path
-//   - Added `isPdfAvailableLocally(filename)` helper for OfflineChunkCard
+// CHANGES FROM PREVIOUS VERSION:
+//   P2 — sqlite-vec native extension loaded in getDb() with graceful fallback
+//   P2 — vec_chunks virtual table added to schema (384-dim float vectors)
+//   P3 — replaceAllChunks() replaced by replaceAllChunksWithVectors()
+//         which stores embeddings into vec_chunks alongside text in chunks/FTS5
+//   P3 — getVectorCount() added
+//   P4 — hybridSearchChunks() added: BM25 (FTS5) + KNN (sqlite-vec) + RRF merge
+//   Backward compat: searchChunks() still exported (used as internal fallback)
 //
 // TABLES:
-//   chunks     — full-text searchable via FTS5 virtual table
-//   sync_meta  — key/value store for sync state (last_synced, etag, etc.)
+//   chunks        — structured chunk metadata
+//   chunks_fts    — FTS5 virtual table for BM25 keyword search
+//   vec_chunks    — sqlite-vec virtual table for KNN semantic search (384-dim)
+//   sync_meta     — key/value sync state (last_synced, etag, counts)
 //
-// NOTE: The FTS5 schema changed (added parent_content column).
-//       On first launch after this update the table is dropped and recreated
-//       automatically. A fresh sync is required to repopulate.
-//
-// REQUIRES: expo-sqlite (~16.x)
+// REQUIRES:
+//   expo-sqlite ~16.x  (loadExtensionAsync support)
+//   sqlite-vec v0.1.6 native binaries via plugins/withSqliteVec.js
 
 import * as SQLite     from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
+import { Platform }    from 'react-native';
 
 // ─────────────────────────────────────────────────────────────
 // DB SINGLETON
 // ─────────────────────────────────────────────────────────────
+
 let _db = null;
 
 async function getDb() {
@@ -37,6 +37,18 @@ async function getDb() {
   // WAL mode — faster writes, safe concurrent reads
   await _db.execAsync('PRAGMA journal_mode = WAL;');
 
+  // ── P2: Load sqlite-vec native extension ──────────────────
+  // Graceful degradation: if the extension isn't bundled (e.g. first run
+  // before prebuild), the app still works with BM25-only search.
+  try {
+    const libName = Platform.OS === 'android' ? 'vec0' : 'vec0.dylib';
+    await _db.loadExtensionAsync(libName);
+    console.log('[DB] sqlite-vec extension loaded ✓');
+  } catch (e) {
+    console.warn('[DB] sqlite-vec not available — BM25-only fallback:', e.message);
+  }
+
+  // ── Schema ────────────────────────────────────────────────
   await _db.execAsync(`
     CREATE TABLE IF NOT EXISTS chunks (
       id             TEXT    PRIMARY KEY,
@@ -45,20 +57,14 @@ async function getDb() {
       parent_content TEXT    NOT NULL DEFAULT '',
       page           INTEGER NOT NULL DEFAULT 0,
       chunk_type     TEXT    NOT NULL DEFAULT 'text',
-      score          REAL    NOT NULL DEFAULT 0,
       section_path   TEXT    NOT NULL DEFAULT '',
       heading        TEXT    NOT NULL DEFAULT '',
       bbox           TEXT    DEFAULT NULL,
       page_width     REAL    DEFAULT NULL,
       page_height    REAL    DEFAULT NULL,
-      synced_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+      synced_at      INTEGER NOT NULL DEFAULT (strftime('%s','now'))
     );
 
-    -- FTS5 virtual table — indexes BOTH content and parent_content
-    -- so broader context is searchable in deep_offline mode.
-    -- content='' means FTS5 stores its own copy (no external content race).
-    -- IMPORTANT: If you change this schema, drop and recreate the table,
-    -- then trigger a fresh sync.
     CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
       id             UNINDEXED,
       content,
@@ -67,42 +73,64 @@ async function getDb() {
       tokenize = 'porter unicode61'
     );
 
-    -- Sync metadata (last_synced ISO string, doc count, server etag, etc.)
     CREATE TABLE IF NOT EXISTS sync_meta (
       key   TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
   `);
 
+  // P2: sqlite-vec table — created separately because it needs the extension loaded.
+  // Wrapped in try/catch so BM25-only mode still works if extension is absent.
+  try {
+    await _db.execAsync(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+        id        TEXT PRIMARY KEY,
+        embedding FLOAT[384]
+      );
+    `);
+    console.log('[DB] vec_chunks table ready ✓');
+  } catch (e) {
+    console.warn('[DB] vec_chunks table not created (extension not loaded):', e.message);
+  }
+
   return _db;
 }
 
 // ─────────────────────────────────────────────────────────────
-// CHUNK OPERATIONS
+// P3: CHUNK OPERATIONS — REPLACE WITH VECTORS
 // ─────────────────────────────────────────────────────────────
 
 /**
- * Replace ALL stored chunks with a fresh batch from the server.
- * Called by syncQueue / useOfflineSearch after a successful /kb/export fetch.
+ * Atomically replace ALL stored chunks, FTS index, AND vector embeddings.
  *
- * Uses a transaction so the wipe + insert is atomic — the app never
- * sees a half-populated database.
+ * Called by syncFromServer() in useOfflineSearch after a successful /kb/export.
+ * The entire operation is a single transaction — the app never sees a half-
+ * populated database.
  *
- * Stores the new enriched fields: bbox, page_width, page_height, section_path.
+ * Vectors are inserted individually with try/catch so one bad embedding
+ * doesn't abort the whole sync.
+ *
+ * @param {Array} chunks — array of chunk objects from /kb/export (with .embedding field)
  */
-export async function replaceAllChunks(chunks) {
+export async function replaceAllChunksWithVectors(chunks) {
   const db = await getDb();
+  let vectorCount = 0;
 
   await db.withTransactionAsync(async () => {
+    // Wipe all three tables atomically
     await db.runAsync('DELETE FROM chunks;');
     await db.runAsync('DELETE FROM chunks_fts;');
+    try {
+      await db.runAsync('DELETE FROM vec_chunks;');
+    } catch {
+      /* extension may not be loaded — continue without vectors */
+    }
 
     for (const c of chunks) {
-      const id = c.id || `${c.source}_${c.page || 0}_${Math.random().toString(36).slice(2)}`;
-
-      // Serialize bbox array as JSON string (SQLite has no array type)
+      const id       = c.id || `${c.source}_${c.page || 0}_${Math.random().toString(36).slice(2)}`;
       const bboxJson = Array.isArray(c.bbox) ? JSON.stringify(c.bbox) : null;
 
+      // 1. Main chunks table
       await db.runAsync(
         `INSERT OR REPLACE INTO chunks
            (id, source, content, parent_content, page, chunk_type,
@@ -123,32 +151,85 @@ export async function replaceAllChunks(chunks) {
         ],
       );
 
-      // Mirror into FTS5 for full-text search — index both content and parent_content
+      // 2. FTS5 index (BM25 keyword search)
       await db.runAsync(
         'INSERT INTO chunks_fts (id, content, parent_content, source) VALUES (?, ?, ?, ?)',
         [id, c.content || '', c.parent_content || c.content || '', c.source || ''],
       );
+
+      // 3. Vector index (KNN semantic search) — skip silently if extension not loaded
+      if (c.embedding && Array.isArray(c.embedding)) {
+        try {
+          const vecBlob = new Float32Array(c.embedding).buffer;
+          await db.runAsync(
+            'INSERT OR REPLACE INTO vec_chunks (id, embedding) VALUES (?, ?)',
+            [id, vecBlob],
+          );
+          vectorCount++;
+        } catch {
+          /* sqlite-vec extension not loaded — silently skip */
+        }
+      }
     }
   });
 
-  console.log(`[DB] Stored ${chunks.length} chunks locally`);
+  console.log(`[DB] Stored ${chunks.length} chunks, ${vectorCount} vectors`);
 }
 
 /**
- * Full-text search using SQLite's built-in FTS5 BM25 ranking.
- * Returns up to `topK` chunks sorted by relevance (best first).
- *
- * Matches against BOTH content (child chunk) and parent_content (broader context)
- * so vocabulary-sparse child chunks still surface relevant parent passages.
- *
- * The porter stemmer means "engine" matches "engines", "engineered", etc.
+ * Legacy alias — kept so any existing callers don't break during migration.
+ * In new code, call replaceAllChunksWithVectors() directly.
  */
-export async function searchChunks(query, topK = 5) {
+export const replaceAllChunks = replaceAllChunksWithVectors;
+
+// ─────────────────────────────────────────────────────────────
+// P4: HYBRID SEARCH — BM25 + KNN + RRF
+// ─────────────────────────────────────────────────────────────
+
+const RRF_K = 60; // standard RRF constant — same as the backend hybrid_retriever.py
+
+/**
+ * Reciprocal Rank Fusion — merge multiple ranked lists into one.
+ *
+ * @param {Array[]} resultLists — array of ranked chunk arrays
+ * @param {number}  topK        — how many results to return
+ */
+function rrfMerge(resultLists, topK) {
+  const scores = new Map(); // id → accumulated RRF score
+  const meta   = new Map(); // id → chunk data (first-seen wins)
+
+  for (const list of resultLists) {
+    list.forEach((chunk, rank) => {
+      scores.set(chunk.id, (scores.get(chunk.id) || 0) + 1 / (RRF_K + rank + 1));
+      if (!meta.has(chunk.id)) meta.set(chunk.id, chunk);
+    });
+  }
+
+  return [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topK)
+    .map(([id, score]) => ({ ...meta.get(id), score: parseFloat(score.toFixed(4)) }));
+}
+
+/**
+ * Hybrid search: BM25 (FTS5) + Semantic KNN (sqlite-vec) → RRF merge.
+ *
+ * - If queryVec is null (embedder unavailable), falls back to BM25-only.
+ * - If sqlite-vec extension is not loaded, KNN step is silently skipped.
+ * - If FTS5 fails, falls back to LIKE search.
+ *
+ * @param {string}           query      — raw user query text
+ * @param {Float32Array|null} queryVec  — on-device embedded query (from embedder.embed())
+ * @param {number}           topK       — final results to return
+ * @param {number}           candidateK — candidates per source before RRF merge
+ * @returns {Promise<Array>} — topK chunk objects with .score field
+ */
+export async function hybridSearchChunks(query, queryVec = null, topK = 5, candidateK = 20) {
   if (!query.trim()) return [];
 
   const db = await getDb();
 
-  // FTS5 match syntax: quote each word to avoid operator errors
+  // ── 1. BM25 via FTS5 ──────────────────────────────────────
   const ftsQuery = query
     .trim()
     .split(/\s+/)
@@ -156,62 +237,105 @@ export async function searchChunks(query, topK = 5) {
     .map(w => `"${w.replace(/"/g, '""')}"`)
     .join(' ');
 
+  let bm25Results = [];
   try {
     const rows = await db.getAllAsync(
-      `SELECT
-         c.id,
-         c.source,
-         c.content,
-         c.parent_content,
-         c.page,
-         c.chunk_type,
-         c.section_path,
-         c.heading,
-         c.bbox,
-         c.page_width,
-         c.page_height,
-         bm25(chunks_fts) AS bm25_score
+      `SELECT c.id, c.source, c.content, c.parent_content, c.page,
+              c.chunk_type, c.section_path, c.heading,
+              c.bbox, c.page_width, c.page_height,
+              bm25(chunks_fts) AS bm25_score
        FROM chunks_fts
        JOIN chunks c ON c.id = chunks_fts.id
        WHERE chunks_fts MATCH ?
-       ORDER BY bm25_score        -- lower = better in SQLite FTS5
+       ORDER BY bm25_score
        LIMIT ?`,
-      [ftsQuery, topK],
+      [ftsQuery, candidateK],
     );
-
-    if (rows.length === 0) return [];
-
-    // Normalise scores to [0, 1] range, higher = better
-    // SQLite's bm25() returns negative values (more negative = better match)
-    const rawScores = rows.map(r => r.bm25_score);
-    const minScore  = Math.min(...rawScores);
-    const maxScore  = Math.max(...rawScores);
-    const range     = maxScore - minScore || 1;
-
-    return rows.map(r => ({
-      id:             r.id,
-      source:         r.source,
-      content:        r.parent_content || r.content,  // prefer broader context for display
-      page:           r.page,
-      chunk_type:     r.chunk_type,
-      section_path:   r.section_path || '',
-      heading:        r.heading      || '',
-      // Parse bbox back from JSON string
-      bbox:           r.bbox ? JSON.parse(r.bbox) : null,
-      page_width:     r.page_width  ?? null,
-      page_height:    r.page_height ?? null,
-      score:          parseFloat(((maxScore - r.bm25_score) / range).toFixed(4)),
+    bm25Results = rows.map(r => ({
+      ...r,
+      content: r.parent_content || r.content,
+      bbox:    r.bbox ? JSON.parse(r.bbox) : null,
     }));
   } catch (e) {
-    // FTS5 match throws if query is malformed (e.g. standalone quotes)
-    // Fall back to a plain LIKE search
-    console.warn('[DB] FTS5 search failed, falling back to LIKE:', e.message);
-    return fallbackSearch(query, topK);
+    console.warn('[DB] FTS5 search error, trying fallback:', e.message);
+    bm25Results = await _fallbackSearch(query, candidateK);
   }
+
+  // ── 2. KNN via sqlite-vec ──────────────────────────────────
+  let vecResults = [];
+  if (queryVec) {
+    try {
+      const vecBlob = queryVec.buffer;
+      const vecRows = await db.getAllAsync(
+        `SELECT v.id, v.distance
+         FROM vec_chunks v
+         WHERE v.embedding MATCH ?
+           AND k = ?
+         ORDER BY v.distance`,
+        [vecBlob, candidateK],
+      );
+
+      if (vecRows.length > 0) {
+        // Fetch full chunk data for the matched IDs
+        const ids          = vecRows.map(r => r.id);
+        const placeholders = ids.map(() => '?').join(',');
+        const chunkRows    = await db.getAllAsync(
+          `SELECT id, source, content, parent_content, page,
+                  chunk_type, section_path, heading,
+                  bbox, page_width, page_height
+           FROM chunks WHERE id IN (${placeholders})`,
+          ids,
+        );
+        const chunkMap = new Map(chunkRows.map(c => [c.id, c]));
+        vecResults = vecRows
+          .filter(r => chunkMap.has(r.id))
+          .map(r => {
+            const chunk = chunkMap.get(r.id);
+            return {
+              ...chunk,
+              content: chunk.parent_content || chunk.content,
+              bbox:    chunk.bbox ? JSON.parse(chunk.bbox) : null,
+            };
+          });
+      }
+    } catch (e) {
+      // Extension not loaded or sqlite-vec query error — log and continue with BM25 only
+      console.warn('[DB] Vector search error (extension not loaded?):', e.message);
+    }
+  }
+
+  // ── 3. RRF merge ──────────────────────────────────────────
+  const sources = [bm25Results, vecResults].filter(l => l.length > 0);
+
+  if (sources.length === 0) return [];
+
+  if (sources.length === 1) {
+    // Only one source — normalize scores without RRF
+    return sources[0].slice(0, topK).map((c, i) => ({
+      ...c,
+      score: parseFloat((1 / (RRF_K + i + 1)).toFixed(4)),
+    }));
+  }
+
+  console.log(`[DB] Hybrid merge: ${bm25Results.length} BM25 + ${vecResults.length} KNN → top ${topK}`);
+  return rrfMerge(sources, topK);
+}
+
+// ─────────────────────────────────────────────────────────────
+// BM25-ONLY SEARCH (kept for backward compatibility + fallback)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * BM25 keyword search (FTS5 only, no vector component).
+ * Used by useChat.js Mode 3 path when no embedder is available,
+ * and as internal fallback inside hybridSearchChunks().
+ */
+export async function searchChunks(query, topK = 5) {
+  return hybridSearchChunks(query, null, topK, topK * 4);
 }
 
 /** LIKE-based fallback if FTS5 query is malformed */
-async function fallbackSearch(query, topK) {
+async function _fallbackSearch(query, topK) {
   const db      = await getDb();
   const pattern = `%${query.trim()}%`;
   const rows    = await db.getAllAsync(
@@ -225,19 +349,35 @@ async function fallbackSearch(query, topK) {
   );
   return rows.map(r => ({
     ...r,
-    content:  r.parent_content || r.content,
-    bbox:     r.bbox ? JSON.parse(r.bbox) : null,
-    score:    r.score,
+    content: r.parent_content || r.content,
+    bbox:    r.bbox ? JSON.parse(r.bbox) : null,
+    score:   r.score,
   }));
 }
 
-/**
- * Check whether a PDF file has been downloaded locally during sync.
- * Used by OfflineChunkCard to conditionally show the "Open in manual" button.
- *
- * @param {string} filename — e.g. "engine_manual.pdf"
- * @returns {Promise<boolean>}
- */
+// ─────────────────────────────────────────────────────────────
+// METADATA HELPERS
+// ─────────────────────────────────────────────────────────────
+
+/** Total number of locally stored chunks */
+export async function getChunkCount() {
+  const db  = await getDb();
+  const row = await db.getFirstAsync('SELECT COUNT(*) AS n FROM chunks;');
+  return row?.n ?? 0;
+}
+
+/** Total number of vectors in sqlite-vec (0 if extension not loaded) */
+export async function getVectorCount() {
+  const db = await getDb();
+  try {
+    const row = await db.getFirstAsync('SELECT COUNT(*) AS n FROM vec_chunks;');
+    return row?.n ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Check whether a PDF file has been downloaded locally during sync */
 export async function isPdfAvailableLocally(filename) {
   if (!filename) return false;
   try {
@@ -249,19 +389,13 @@ export async function isPdfAvailableLocally(filename) {
   }
 }
 
-/** Total number of locally stored chunks */
-export async function getChunkCount() {
-  const db  = await getDb();
-  const row = await db.getFirstAsync('SELECT COUNT(*) AS n FROM chunks;');
-  return row?.n ?? 0;
-}
-
-/** Wipe all chunks and FTS index */
+/** Wipe all chunks, FTS index, and vectors */
 export async function clearChunks() {
   const db = await getDb();
   await db.withTransactionAsync(async () => {
     await db.runAsync('DELETE FROM chunks;');
     await db.runAsync('DELETE FROM chunks_fts;');
+    try { await db.runAsync('DELETE FROM vec_chunks;'); } catch { /* no extension */ }
   });
   console.log('[DB] Local chunks cleared');
 }
