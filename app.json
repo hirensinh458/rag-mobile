@@ -11,20 +11,13 @@
       "expo-dev-client",
       "expo-sqlite",
       "./plugins/withSqliteVec",
-      [
-        "expo-build-properties",
-        {
-          "android": {
-            "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
-          }
+      ["expo-build-properties", {
+        "android": {
+          "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
         }
-      ]
+      }]
     ],
     "android": {
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0D0D12"
-      },
       "package": "com.ragmobile"
     },
     "assets": ["./assets/models/"]
