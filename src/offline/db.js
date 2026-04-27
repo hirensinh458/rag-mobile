@@ -7,6 +7,9 @@
 //         which stores embeddings into vec_chunks alongside text in chunks/FTS5
 //   P3 — getVectorCount() added
 //   P4 — hybridSearchChunks() added: BM25 (FTS5) + KNN (sqlite-vec) + RRF merge
+//   FIX — getDb() now uses a _dbInit promise guard to prevent concurrent init
+//          (fixes NullPointerException when multiple callers hit getDb() before
+//           _db is assigned)
 //   Backward compat: searchChunks() still exported (used as internal fallback)
 //
 // TABLES:
@@ -24,32 +27,54 @@ import * as FileSystem from 'expo-file-system/legacy';
 import { Platform }    from 'react-native';
 
 // ─────────────────────────────────────────────────────────────
-// DB SINGLETON
+// DB SINGLETON — promise-guarded to prevent concurrent init
 // ─────────────────────────────────────────────────────────────
+//
+// Problem (old code):
+//   Multiple callers could all pass the `if (_db) return _db` check at the
+//   same moment before _db was assigned, each spawning their own
+//   openDatabaseAsync() call → NullPointerException on prepareAsync.
+//
+// Fix:
+//   _dbInit stores the in-flight Promise. Every concurrent caller awaits the
+//   same promise — only one openDatabaseAsync() ever runs.
+//   _db is assigned only after the DB is fully initialized (schema + extension).
 
-let _db = null;
+let _db     = null;
+let _dbInit = null; // Promise guard — ensures _initDb() runs exactly once
 
 async function getDb() {
   if (_db) return _db;
+  if (!_dbInit) {
+    _dbInit = _initDb().catch(err => {
+      // Reset so a future call can retry after a transient failure
+      _dbInit = null;
+      _db     = null;
+      throw err;
+    });
+  }
+  return _dbInit;
+}
 
-  _db = await SQLite.openDatabaseAsync('rag_offline.db');
+async function _initDb() {
+  const db = await SQLite.openDatabaseAsync('rag_offline.db');
 
   // WAL mode — faster writes, safe concurrent reads
-  await _db.execAsync('PRAGMA journal_mode = WAL;');
+  await db.execAsync('PRAGMA journal_mode = WAL;');
 
   // ── P2: Load sqlite-vec native extension ──────────────────
   // Graceful degradation: if the extension isn't bundled (e.g. first run
   // before prebuild), the app still works with BM25-only search.
   try {
     const libName = Platform.OS === 'android' ? 'vec0' : 'vec0.dylib';
-    await _db.loadExtensionAsync(libName);
+    await db.loadExtensionAsync(libName);
     console.log('[DB] sqlite-vec extension loaded ✓');
   } catch (e) {
     console.warn('[DB] sqlite-vec not available — BM25-only fallback:', e.message);
   }
 
   // ── Schema ────────────────────────────────────────────────
-  await _db.execAsync(`
+  await db.execAsync(`
     CREATE TABLE IF NOT EXISTS chunks (
       id             TEXT    PRIMARY KEY,
       source         TEXT    NOT NULL DEFAULT '',
@@ -82,7 +107,7 @@ async function getDb() {
   // P2: sqlite-vec table — created separately because it needs the extension loaded.
   // Wrapped in try/catch so BM25-only mode still works if extension is absent.
   try {
-    await _db.execAsync(`
+    await db.execAsync(`
       CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
         id        TEXT PRIMARY KEY,
         embedding FLOAT[384]
@@ -93,6 +118,9 @@ async function getDb() {
     console.warn('[DB] vec_chunks table not created (extension not loaded):', e.message);
   }
 
+  // Assign to _db only after fully initialized — concurrent callers now get
+  // a fully-ready instance, never a partially-initialized one.
+  _db = db;
   return _db;
 }
 

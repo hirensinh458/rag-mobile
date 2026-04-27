@@ -3,20 +3,28 @@
     "name": "rag-mobile",
     "slug": "rag-mobile",
     "version": "1.0.0",
-    "assetBundlePatterns": ["assets/models/**"],
+    "assetBundlePatterns": [
+      "assets/models/**"
+    ],
     "extra": {
-      "eas": { "projectId": "3df568cc-8bca-4f72-8ce6-17cbdc5d68b6" }
+      "eas": {
+        "projectId": "3df568cc-8bca-4f72-8ce6-17cbdc5d68b6"
+      }
     },
     "plugins": [
       "expo-secure-store",
       "expo-dev-client",
       "expo-sqlite",
       "./plugins/withSqliteVec",
-      ["expo-build-properties", {
-        "android": {
-          "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
+          }
         }
-      }]
+      ],
+      "expo-asset"
     ],
     "android": {
       "package": "com.ragmobile"
