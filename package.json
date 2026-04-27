@@ -3,8 +3,9 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "expo start --dev-client",
-    "android": "expo run:android",
+    "start": "NODE_OPTIONS=--max-old-space-size=4096 expo start",
+    "start:dev": "NODE_OPTIONS=--max-old-space-size=4096 expo start --dev-client",
+    "android": "NODE_OPTIONS=--max-old-space-size=4096 expo run:android",
     "ios": "expo run:ios",
     "web": "expo start --web"
   },

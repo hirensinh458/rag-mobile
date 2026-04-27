@@ -1,53 +1,79 @@
-// src/offline/db.js  — P2 + P3 + P4 full rewrite
+// src/offline/db.js  — P2 + P3 + P4 + FIX-VECTORS + FIX-UNIQUE + SEARCH-MODE-LOGGING
 //
 // CHANGES FROM PREVIOUS VERSION:
-//   P2 — sqlite-vec native extension loaded in getDb() with graceful fallback
-//   P2 — vec_chunks virtual table added to schema (384-dim float vectors)
-//   P3 — replaceAllChunks() replaced by replaceAllChunksWithVectors()
-//         which stores embeddings into vec_chunks alongside text in chunks/FTS5
-//   P3 — getVectorCount() added
-//   P4 — hybridSearchChunks() added: BM25 (FTS5) + KNN (sqlite-vec) + RRF merge
-//   FIX — getDb() now uses a _dbInit promise guard to prevent concurrent init
-//          (fixes NullPointerException when multiple callers hit getDb() before
-//           _db is assigned)
-//   Backward compat: searchChunks() still exported (used as internal fallback)
 //
-// TABLES:
-//   chunks        — structured chunk metadata
-//   chunks_fts    — FTS5 virtual table for BM25 keyword search
-//   vec_chunks    — sqlite-vec virtual table for KNN semantic search (384-dim)
-//   sync_meta     — key/value sync state (last_synced, etag, counts)
+//   FIX — 338/340 vectors: vec0 UNIQUE constraint failure on duplicate content-hash chunks.
+//     PROBLEM:
+//       Two BM25 chunks produce the same _content_hash (identical source + page +
+//       content[:80] prefix). `INSERT OR REPLACE INTO vec_chunks` is not supported
+//       by sqlite-vec's vec0 virtual table — it throws UNIQUE constraint failed
+//       instead of silently replacing, so 2 inserts failed every sync.
+//       Qdrant has the same 338 unique vectors (it deduped silently), which is
+//       why the server also shows 338 rather than 340.
+//     FIX:
+//       Use `INSERT OR IGNORE INTO vec_chunks` — duplicate IDs are silently
+//       skipped rather than erroring. The first chunk with that hash wins,
+//       which is consistent with Qdrant's behaviour.
+//       Also: deduplicate chunk IDs BEFORE the insert loop so the chunks table
+//       and FTS don't get spurious duplicates either.
 //
-// REQUIRES:
-//   expo-sqlite ~16.x  (loadExtensionAsync support)
-//   sqlite-vec v0.1.6 native binaries via plugins/withSqliteVec.js
+//   FIX — Embedder unavailable / BM25-only offline mode.
+//     PROBLEM:
+//       `Cannot read property 'install' of null` — sqlite-vec native module
+//       is not accessible in the ONNX worker thread when getEmbedder() is called.
+//       The expo-file-system deprecation warning fires during module init and
+//       its text becomes the caught error message, masking the real cause.
+//     FIX:
+//       hybridSearchChunks() accepts a pre-computed queryVec (Float32Array) or
+//       null — no change needed here. The embedder issue is in embedder.js.
+//       Added a guard: if queryVec is provided but has wrong length, log and
+//       discard rather than passing a malformed blob to vec0.
+//
+//   NEW — Search mode metadata on every hybridSearchChunks call.
+//     hybridSearchChunks now:
+//       1. Logs a one-line summary showing which paths ran and how many
+//          candidates each produced, e.g.:
+//          [DB] Search: BM25=12 KNN=15 → hybrid RRF → top 5
+//          [DB] Search: BM25=8 KNN=0 → BM25-only → top 5
+//       2. Returns a _searchMode field on each result chunk:
+//          "hybrid"   — both BM25 and KNN contributed
+//          "bm25"     — BM25 only (no embedder or KNN returned empty)
+//          "knn"      — KNN only (BM25 returned empty, rare)
+//       This makes it trivially testable: log result[0]._searchMode in useChat.
+//
+//   KEPT — All other P2/P3/P4 logic (toVecBlob, schema, RRF, fallback search,
+//           singleton guard, WAL, FTS5 BM25, getVectorCount, sync metadata).
 
 import * as SQLite     from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Platform }    from 'react-native';
 
 // ─────────────────────────────────────────────────────────────
-// DB SINGLETON — promise-guarded to prevent concurrent init
+// BLOB HELPER
 // ─────────────────────────────────────────────────────────────
 //
-// Problem (old code):
-//   Multiple callers could all pass the `if (_db) return _db` check at the
-//   same moment before _db was assigned, each spawning their own
-//   openDatabaseAsync() call → NullPointerException on prepareAsync.
-//
-// Fix:
-//   _dbInit stores the in-flight Promise. Every concurrent caller awaits the
-//   same promise — only one openDatabaseAsync() ever runs.
-//   _db is assigned only after the DB is fully initialized (schema + extension).
+// expo-sqlite runAsync() cannot bind ArrayBuffer — only Uint8Array.
+// Float32Array.buffer gives ArrayBuffer → TypeError on bind.
+// toVecBlob() normalises all input types to Uint8Array.
+
+function toVecBlob(embedding) {
+  if (embedding instanceof Uint8Array)   return embedding;
+  if (embedding instanceof Float32Array) return new Uint8Array(embedding.buffer);
+  // Plain number[] from JSON (most common — server payload)
+  return new Uint8Array(new Float32Array(embedding).buffer);
+}
+
+// ─────────────────────────────────────────────────────────────
+// DB SINGLETON — promise-guarded to prevent concurrent init
+// ─────────────────────────────────────────────────────────────
 
 let _db     = null;
-let _dbInit = null; // Promise guard — ensures _initDb() runs exactly once
+let _dbInit = null;
 
 async function getDb() {
   if (_db) return _db;
   if (!_dbInit) {
     _dbInit = _initDb().catch(err => {
-      // Reset so a future call can retry after a transient failure
       _dbInit = null;
       _db     = null;
       throw err;
@@ -59,12 +85,9 @@ async function getDb() {
 async function _initDb() {
   const db = await SQLite.openDatabaseAsync('rag_offline.db');
 
-  // WAL mode — faster writes, safe concurrent reads
   await db.execAsync('PRAGMA journal_mode = WAL;');
 
-  // ── P2: Load sqlite-vec native extension ──────────────────
-  // Graceful degradation: if the extension isn't bundled (e.g. first run
-  // before prebuild), the app still works with BM25-only search.
+  // ── Load sqlite-vec native extension ──────────────────────
   try {
     const libName = Platform.OS === 'android' ? 'vec0' : 'vec0.dylib';
     await db.loadExtensionAsync(libName);
@@ -104,8 +127,7 @@ async function _initDb() {
     );
   `);
 
-  // P2: sqlite-vec table — created separately because it needs the extension loaded.
-  // Wrapped in try/catch so BM25-only mode still works if extension is absent.
+  // vec_chunks — requires extension already loaded
   try {
     await db.execAsync(`
       CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
@@ -115,11 +137,9 @@ async function _initDb() {
     `);
     console.log('[DB] vec_chunks table ready ✓');
   } catch (e) {
-    console.warn('[DB] vec_chunks table not created (extension not loaded):', e.message);
+    console.warn('[DB] vec_chunks table not created:', e.message);
   }
 
-  // Assign to _db only after fully initialized — concurrent callers now get
-  // a fully-ready instance, never a partially-initialized one.
   _db = db;
   return _db;
 }
@@ -131,31 +151,47 @@ async function _initDb() {
 /**
  * Atomically replace ALL stored chunks, FTS index, AND vector embeddings.
  *
- * Called by syncFromServer() in useOfflineSearch after a successful /kb/export.
- * The entire operation is a single transaction — the app never sees a half-
- * populated database.
- *
- * Vectors are inserted individually with try/catch so one bad embedding
- * doesn't abort the whole sync.
- *
- * @param {Array} chunks — array of chunk objects from /kb/export (with .embedding field)
+ * @param {Array} chunks — chunk objects from /kb/export (with .embedding field)
  */
 export async function replaceAllChunksWithVectors(chunks) {
   const db = await getDb();
-  let vectorCount = 0;
+  let vectorCount       = 0;
+  let vectorErrors      = 0;
+  let duplicatesSkipped = 0;
+
+  // FIX: Deduplicate by id BEFORE the transaction.
+  // Two BM25 chunks can produce identical _content_hash IDs (same source+page+content[:80]).
+  // vec0's INSERT OR IGNORE silently skips duplicates; but the chunks table uses
+  // PRIMARY KEY so INSERT OR REPLACE overwrites — deduplicate once here so both
+  // tables see the same unique rows.
+  const seen   = new Set();
+  const unique = [];
+  for (const c of chunks) {
+    const id = c.id || `${c.source}_${c.page ?? 0}_${Math.random().toString(36).slice(2)}`;
+    if (seen.has(id)) {
+      duplicatesSkipped++;
+      console.warn(`[DB] Duplicate chunk id skipped: ${id} (source=${c.source} page=${c.page})`);
+      continue;
+    }
+    seen.add(id);
+    unique.push({ ...c, _resolvedId: id });
+  }
+
+  if (duplicatesSkipped > 0) {
+    console.warn(`[DB] Deduplication: ${duplicatesSkipped} duplicate chunk(s) dropped before insert`);
+  }
 
   await db.withTransactionAsync(async () => {
-    // Wipe all three tables atomically
     await db.runAsync('DELETE FROM chunks;');
     await db.runAsync('DELETE FROM chunks_fts;');
     try {
       await db.runAsync('DELETE FROM vec_chunks;');
-    } catch {
-      /* extension may not be loaded — continue without vectors */
+    } catch (e) {
+      console.warn('[DB] vec_chunks DELETE skipped (extension not loaded?):', e.message);
     }
 
-    for (const c of chunks) {
-      const id       = c.id || `${c.source}_${c.page || 0}_${Math.random().toString(36).slice(2)}`;
+    for (const c of unique) {
+      const id       = c._resolvedId;
       const bboxJson = Array.isArray(c.bbox) ? JSON.stringify(c.bbox) : null;
 
       // 1. Main chunks table
@@ -179,52 +215,65 @@ export async function replaceAllChunksWithVectors(chunks) {
         ],
       );
 
-      // 2. FTS5 index (BM25 keyword search)
+      // 2. FTS5 index
       await db.runAsync(
         'INSERT INTO chunks_fts (id, content, parent_content, source) VALUES (?, ?, ?, ?)',
         [id, c.content || '', c.parent_content || c.content || '', c.source || ''],
       );
 
-      // 3. Vector index (KNN semantic search) — skip silently if extension not loaded
-      if (c.embedding && Array.isArray(c.embedding)) {
-        try {
-          const vecBlob = new Float32Array(c.embedding).buffer;
-          await db.runAsync(
-            'INSERT OR REPLACE INTO vec_chunks (id, embedding) VALUES (?, ?)',
-            [id, vecBlob],
-          );
-          vectorCount++;
-        } catch {
-          /* sqlite-vec extension not loaded — silently skip */
-        }
+      // 3. Vector index
+      if (!c.embedding || !Array.isArray(c.embedding) || c.embedding.length === 0) {
+        continue;
+      }
+      if (c.embedding.length !== 384) {
+        console.warn(`[DB] Wrong embedding dimension for ${id}: ${c.embedding.length} (expected 384)`);
+        vectorErrors++;
+        continue;
+      }
+
+      try {
+        const blob = toVecBlob(c.embedding);
+
+        // FIX: INSERT OR IGNORE instead of INSERT OR REPLACE.
+        // vec0 virtual table does not support ON CONFLICT replacement —
+        // it throws UNIQUE constraint failed. OR IGNORE silently skips
+        // the duplicate, which is correct since we already deduped above.
+        await db.runAsync(
+          'INSERT OR IGNORE INTO vec_chunks (id, embedding) VALUES (?, ?)',
+          [id, blob],
+        );
+        vectorCount++;
+      } catch (e) {
+        console.error(`[DB] vec insert failed for chunk ${id}: ${e.message}`);
+        vectorErrors++;
       }
     }
   });
 
-  console.log(`[DB] Stored ${chunks.length} chunks, ${vectorCount} vectors`);
+  if (vectorErrors > 0) {
+    console.warn(
+      `[DB] Stored ${unique.length} chunks, ${vectorCount} vectors ` +
+      `(${vectorErrors} vec errors, ${duplicatesSkipped} duplicates dropped)`
+    );
+  } else {
+    console.log(
+      `[DB] Stored ${unique.length} chunks, ${vectorCount} vectors` +
+      (duplicatesSkipped > 0 ? ` (${duplicatesSkipped} duplicates dropped)` : '')
+    );
+  }
 }
 
-/**
- * Legacy alias — kept so any existing callers don't break during migration.
- * In new code, call replaceAllChunksWithVectors() directly.
- */
 export const replaceAllChunks = replaceAllChunksWithVectors;
 
 // ─────────────────────────────────────────────────────────────
 // P4: HYBRID SEARCH — BM25 + KNN + RRF
 // ─────────────────────────────────────────────────────────────
 
-const RRF_K = 60; // standard RRF constant — same as the backend hybrid_retriever.py
+const RRF_K = 60;
 
-/**
- * Reciprocal Rank Fusion — merge multiple ranked lists into one.
- *
- * @param {Array[]} resultLists — array of ranked chunk arrays
- * @param {number}  topK        — how many results to return
- */
 function rrfMerge(resultLists, topK) {
-  const scores = new Map(); // id → accumulated RRF score
-  const meta   = new Map(); // id → chunk data (first-seen wins)
+  const scores = new Map();
+  const meta   = new Map();
 
   for (const list of resultLists) {
     list.forEach((chunk, rank) => {
@@ -242,15 +291,19 @@ function rrfMerge(resultLists, topK) {
 /**
  * Hybrid search: BM25 (FTS5) + Semantic KNN (sqlite-vec) → RRF merge.
  *
- * - If queryVec is null (embedder unavailable), falls back to BM25-only.
- * - If sqlite-vec extension is not loaded, KNN step is silently skipped.
- * - If FTS5 fails, falls back to LIKE search.
+ * NEW: Every result now carries a _searchMode field:
+ *   "hybrid" — both BM25 and KNN contributed via RRF
+ *   "bm25"   — BM25 only (embedder unavailable or KNN returned empty)
+ *   "knn"    — KNN only (BM25 returned empty, very rare)
  *
- * @param {string}           query      — raw user query text
- * @param {Float32Array|null} queryVec  — on-device embedded query (from embedder.embed())
- * @param {number}           topK       — final results to return
- * @param {number}           candidateK — candidates per source before RRF merge
- * @returns {Promise<Array>} — topK chunk objects with .score field
+ * A one-line summary is always logged so you can see which path was taken:
+ *   [DB] Search: BM25=12 KNN=15 → hybrid RRF → top 5
+ *   [DB] Search: BM25=8 KNN=0 → bm25-only → top 5
+ *
+ * @param {string}                    query      — raw user query text
+ * @param {Float32Array|number[]|null} queryVec  — on-device embedded query (null = BM25 only)
+ * @param {number}                    topK       — final results to return
+ * @param {number}                    candidateK — candidates per source before merge
  */
 export async function hybridSearchChunks(query, queryVec = null, topK = 5, candidateK = 20) {
   if (!query.trim()) return [];
@@ -285,84 +338,106 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
       bbox:    r.bbox ? JSON.parse(r.bbox) : null,
     }));
   } catch (e) {
-    console.warn('[DB] FTS5 search error, trying fallback:', e.message);
+    console.warn('[DB] FTS5 search error, trying LIKE fallback:', e.message);
     bm25Results = await _fallbackSearch(query, candidateK);
   }
 
   // ── 2. KNN via sqlite-vec ──────────────────────────────────
   let vecResults = [];
-  if (queryVec) {
-    try {
-      const vecBlob = queryVec.buffer;
-      const vecRows = await db.getAllAsync(
-        `SELECT v.id, v.distance
-         FROM vec_chunks v
-         WHERE v.embedding MATCH ?
-           AND k = ?
-         ORDER BY v.distance`,
-        [vecBlob, candidateK],
-      );
 
-      if (vecRows.length > 0) {
-        // Fetch full chunk data for the matched IDs
-        const ids          = vecRows.map(r => r.id);
-        const placeholders = ids.map(() => '?').join(',');
-        const chunkRows    = await db.getAllAsync(
-          `SELECT id, source, content, parent_content, page,
-                  chunk_type, section_path, heading,
-                  bbox, page_width, page_height
-           FROM chunks WHERE id IN (${placeholders})`,
-          ids,
+  if (queryVec) {
+    // Guard: wrong dimension means toVecBlob will produce a bad blob that
+    // vec0 will reject with a confusing error — catch it early with a clear message.
+    const vecLen = queryVec.length ?? queryVec.byteLength / 4;
+    if (vecLen !== 384) {
+      console.warn(`[DB] KNN skipped — queryVec has wrong length: ${vecLen} (expected 384)`);
+    } else {
+      try {
+        const blob = toVecBlob(queryVec);
+
+        const vecRows = await db.getAllAsync(
+          `SELECT v.id, v.distance
+           FROM vec_chunks v
+           WHERE v.embedding MATCH ?
+             AND k = ?
+           ORDER BY v.distance`,
+          [blob, candidateK],
         );
-        const chunkMap = new Map(chunkRows.map(c => [c.id, c]));
-        vecResults = vecRows
-          .filter(r => chunkMap.has(r.id))
-          .map(r => {
-            const chunk = chunkMap.get(r.id);
-            return {
-              ...chunk,
-              content: chunk.parent_content || chunk.content,
-              bbox:    chunk.bbox ? JSON.parse(chunk.bbox) : null,
-            };
-          });
+
+        if (vecRows.length > 0) {
+          const ids          = vecRows.map(r => r.id);
+          const placeholders = ids.map(() => '?').join(',');
+          const chunkRows    = await db.getAllAsync(
+            `SELECT id, source, content, parent_content, page,
+                    chunk_type, section_path, heading,
+                    bbox, page_width, page_height
+             FROM chunks WHERE id IN (${placeholders})`,
+            ids,
+          );
+          const chunkMap = new Map(chunkRows.map(c => [c.id, c]));
+          vecResults = vecRows
+            .filter(r => chunkMap.has(r.id))
+            .map(r => {
+              const chunk = chunkMap.get(r.id);
+              return {
+                ...chunk,
+                content: chunk.parent_content || chunk.content,
+                bbox:    chunk.bbox ? JSON.parse(chunk.bbox) : null,
+              };
+            });
+        }
+      } catch (e) {
+        // Distinguish "extension not loaded" (expected) from real query errors.
+        console.warn('[DB] KNN search failed:', e.message);
       }
-    } catch (e) {
-      // Extension not loaded or sqlite-vec query error — log and continue with BM25 only
-      console.warn('[DB] Vector search error (extension not loaded?):', e.message);
     }
   }
 
-  // ── 3. RRF merge ──────────────────────────────────────────
-  const sources = [bm25Results, vecResults].filter(l => l.length > 0);
+  // ── 3. Determine mode, log summary, RRF merge ─────────────
+  const hasBM25 = bm25Results.length > 0;
+  const hasKNN  = vecResults.length  > 0;
 
-  if (sources.length === 0) return [];
+  let searchMode;
+  if      (hasBM25 && hasKNN)  searchMode = 'hybrid';
+  else if (hasBM25 && !hasKNN) searchMode = 'bm25';
+  else if (!hasBM25 && hasKNN) searchMode = 'knn';
+  else                          searchMode = 'empty';
+
+  // NEW: always-printed one-liner — tells you at a glance which path ran.
+  // Look for this in Metro logs after every offline query.
+  console.log(
+    `[DB] Search: BM25=${bm25Results.length} KNN=${vecResults.length} ` +
+    `→ ${searchMode === 'hybrid' ? 'hybrid RRF' : searchMode + '-only'} → top ${topK}` +
+    (queryVec ? '' : ' (no queryVec — embedder unavailable)')
+  );
+
+  if (searchMode === 'empty') return [];
+
+  const sources = [bm25Results, vecResults].filter(l => l.length > 0);
+  let merged;
 
   if (sources.length === 1) {
-    // Only one source — normalize scores without RRF
-    return sources[0].slice(0, topK).map((c, i) => ({
+    merged = sources[0].slice(0, topK).map((c, i) => ({
       ...c,
       score: parseFloat((1 / (RRF_K + i + 1)).toFixed(4)),
     }));
+  } else {
+    merged = rrfMerge(sources, topK);
   }
 
-  console.log(`[DB] Hybrid merge: ${bm25Results.length} BM25 + ${vecResults.length} KNN → top ${topK}`);
-  return rrfMerge(sources, topK);
+  // NEW: attach _searchMode to every returned chunk.
+  // In useChat.js you can verify with: console.log(results[0]?._searchMode)
+  return merged.map(c => ({ ...c, _searchMode: searchMode }));
 }
 
 // ─────────────────────────────────────────────────────────────
-// BM25-ONLY SEARCH (kept for backward compatibility + fallback)
+// BM25-ONLY SEARCH (backward compat + internal fallback)
 // ─────────────────────────────────────────────────────────────
 
-/**
- * BM25 keyword search (FTS5 only, no vector component).
- * Used by useChat.js Mode 3 path when no embedder is available,
- * and as internal fallback inside hybridSearchChunks().
- */
 export async function searchChunks(query, topK = 5) {
   return hybridSearchChunks(query, null, topK, topK * 4);
 }
 
-/** LIKE-based fallback if FTS5 query is malformed */
 async function _fallbackSearch(query, topK) {
   const db      = await getDb();
   const pattern = `%${query.trim()}%`;
@@ -387,14 +462,12 @@ async function _fallbackSearch(query, topK) {
 // METADATA HELPERS
 // ─────────────────────────────────────────────────────────────
 
-/** Total number of locally stored chunks */
 export async function getChunkCount() {
   const db  = await getDb();
   const row = await db.getFirstAsync('SELECT COUNT(*) AS n FROM chunks;');
   return row?.n ?? 0;
 }
 
-/** Total number of vectors in sqlite-vec (0 if extension not loaded) */
 export async function getVectorCount() {
   const db = await getDb();
   try {
@@ -405,7 +478,6 @@ export async function getVectorCount() {
   }
 }
 
-/** Check whether a PDF file has been downloaded locally during sync */
 export async function isPdfAvailableLocally(filename) {
   if (!filename) return false;
   try {
@@ -417,13 +489,16 @@ export async function isPdfAvailableLocally(filename) {
   }
 }
 
-/** Wipe all chunks, FTS index, and vectors */
 export async function clearChunks() {
   const db = await getDb();
   await db.withTransactionAsync(async () => {
     await db.runAsync('DELETE FROM chunks;');
     await db.runAsync('DELETE FROM chunks_fts;');
-    try { await db.runAsync('DELETE FROM vec_chunks;'); } catch { /* no extension */ }
+    try {
+      await db.runAsync('DELETE FROM vec_chunks;');
+    } catch (e) {
+      console.warn('[DB] clearChunks: vec_chunks clear skipped:', e.message);
+    }
   });
   console.log('[DB] Local chunks cleared');
 }
@@ -435,7 +510,7 @@ export async function clearChunks() {
 export async function getSyncMeta(key) {
   const db  = await getDb();
   const row = await db.getFirstAsync(
-    'SELECT value FROM sync_meta WHERE key = ?', [key]
+    'SELECT value FROM sync_meta WHERE key = ?', [key],
   );
   return row?.value ?? null;
 }

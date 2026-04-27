@@ -1,20 +1,26 @@
-// src/hooks/useOfflineSearch.js  — P3 + P4 + P5 full rewrite
+// src/hooks/useOfflineSearch.js
 //
-// CHANGES FROM PREVIOUS VERSION:
-//   P3 — syncFromServer() uses etag-based delta sync (304 = skip DB write)
-//   P3 — replaceAllChunksWithVectors() called instead of replaceAllChunks()
-//   P3 — vector_count persisted in sync_meta
-//   P4 — localSearch() exported: embeds query on-device → hybridSearchChunks()
-//   P5 — Effect 3: fixed-interval 10-min polling loop while server is reachable
-//   P5 — triggerSync() accepts { force } option to bypass stale check
-//   SYNC_STALE_MS aligned to POLL_INTERVAL_MS (both 10 min)
+// CHANGES vs previous version:
+//   FIX — result.vectors previously counted embeddings in the received JSON payload,
+//         not what was actually stored in SQLite. The sync-complete log therefore
+//         showed "340 vectors" while DB had 0 — the failure was invisible.
+//         Now: vectors count comes from getVectorCount() AFTER the DB write, so
+//         it reflects ground truth. result.vectors is removed entirely.
 //
-// EXPORTS:
-//   useOfflineSearch(mode, activeUrl) — auto-sync hook (use in ChatScreen)
-//   localSearch(query, topK)          — hybrid BM25+KNN search (use in useChat)
+//   FIX — Pre-write embedding validation with detailed logging: logs shape, type,
+//         and sample value of the first embedding before calling replaceAllChunksWithVectors.
+//         This immediately surfaces any Float32Array / plain-array mismatch in db.js.
+//
+//   FIX — Sync-complete log now shows storedVectors (from DB) vs receivedVectors
+//         (from JSON) side by side so any future storage loss is immediately visible.
+//
+//   FIX — syncFromServer returns storedVectors from getVectorCount() after write,
+//         not a count derived from the payload.
+//
+//   KEPT — All P3/P4/P5 logic unchanged (etag delta, on-device embedder, polling).
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { NetworkMode }                from './useNetwork';
+import { NetworkMode } from './useNetwork';
 import {
   replaceAllChunksWithVectors,
   setSyncMeta,
@@ -22,18 +28,12 @@ import {
   getChunkCount,
   getVectorCount,
   hybridSearchChunks,
-}                                     from '../offline/db';
-import { getEmbedder }                from '../offline/embedder';
-import { syncPdfs }                   from '../offline/pdfSync';
-import { apiFetch }                   from '../api/client';
+} from '../offline/db';
+import { getEmbedder } from '../offline/embedder';
+import { syncPdfs } from '../offline/pdfSync';
 
-// ─────────────────────────────────────────────────────────────
-// CONSTANTS
-// ─────────────────────────────────────────────────────────────
-
-// P5: Both aligned so every poll tick actually syncs when data is new.
-const SYNC_STALE_MS    = 10 * 60 * 1000; // 10 minutes
-const POLL_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const SYNC_STALE_MS    = 10 * 60 * 1000;
+const POLL_INTERVAL_MS = 10 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────
 // P4: ON-DEVICE EMBEDDER (module-level singleton)
@@ -47,7 +47,6 @@ async function getLocalEmbedder() {
     _embedder = await getEmbedder();
     console.log('[useOfflineSearch] On-device embedder ready');
   } catch (e) {
-    // Not fatal — falls back to BM25-only search
     console.warn('[useOfflineSearch] Embedder unavailable, BM25 only:', e.message);
     _embedder = null;
   }
@@ -58,14 +57,6 @@ async function getLocalEmbedder() {
 // P4: localSearch — called by useChat.js in Mode 3
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Hybrid local search: embeds the query on-device then calls hybridSearchChunks().
- * Falls back to BM25-only if the embedder is unavailable.
- *
- * @param {string} query  — raw user question
- * @param {number} topK   — number of results to return (default 5)
- * @returns {Promise<Array>} — ranked chunk objects with .score
- */
 export async function localSearch(query, topK = 5) {
   let queryVec = null;
   try {
@@ -74,7 +65,6 @@ export async function localSearch(query, topK = 5) {
   } catch (e) {
     console.warn('[useOfflineSearch] Embed failed, using BM25 only:', e.message);
   }
-
   return hybridSearchChunks(query, queryVec, topK);
 }
 
@@ -86,10 +76,51 @@ async function shouldSync() {
   try {
     const lastSynced = await getSyncMeta('last_synced');
     if (!lastSynced) return true;
-    const elapsed = Date.now() - new Date(lastSynced).getTime();
-    return elapsed > SYNC_STALE_MS;
+    return Date.now() - new Date(lastSynced).getTime() > SYNC_STALE_MS;
   } catch {
     return true;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// EMBEDDING VALIDATOR
+// Logs the shape of what's about to be written to SQLite so any
+// Float32Array / plain-array mismatch in db.js is immediately visible.
+// ─────────────────────────────────────────────────────────────
+
+function validateAndLogEmbeddings(chunks) {
+  const withEmbedding = chunks.filter(c => c.embedding != null);
+  const without       = chunks.length - withEmbedding.length;
+
+  console.log(
+    `[SYNC/validate] ${chunks.length} chunks total — ` +
+    `${withEmbedding.length} have embedding, ${without} do not`
+  );
+
+  if (withEmbedding.length === 0) {
+    console.warn('[SYNC/validate] ⚠ No embeddings in payload — server may not be sending vectors');
+    return;
+  }
+
+  // Inspect first embedding for type/shape issues
+  const first = withEmbedding[0].embedding;
+  console.log(
+    `[SYNC/validate] First embedding — ` +
+    `type=${Object.prototype.toString.call(first)}, ` +
+    `length=${first?.length}, ` +
+    `isArray=${Array.isArray(first)}, ` +
+    `isFloat32=${first instanceof Float32Array}, ` +
+    `sample=[${Array.isArray(first) ? first.slice(0, 3).map(v => v.toFixed(4)).join(', ') : 'n/a'}]`
+  );
+
+  // Warn if it's a plain array — db.js MUST convert to Float32Array before
+  // inserting into sqlite-vec, otherwise the write silently drops the vector.
+  if (Array.isArray(first)) {
+    console.warn(
+      '[SYNC/validate] ⚠ Embeddings are plain JS arrays. ' +
+      'db.js must call new Float32Array(embedding).buffer before sqlite-vec insert. ' +
+      'If not done, vectors will be stored as 0.'
+    );
   }
 }
 
@@ -97,64 +128,91 @@ async function shouldSync() {
 // P3: syncFromServer — etag delta + vector sync
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Fetch chunks + vectors from /kb/export, store in SQLite, sync PDFs.
- *
- * Delta sync: sends the stored etag in If-None-Match header.
- * If the server returns 304, the chunk/vector sync is skipped entirely.
- * PDF sync always runs (PDFs tracked independently of the etag).
- *
- * @param {string} activeUrl — base URL from useNetwork.activeUrl
- */
 async function syncFromServer(activeUrl) {
-  // 1. Read stored etag for conditional request
   const storedEtag = await getSyncMeta('export_etag') || '';
 
-  // 2. Fetch /kb/export (with vectors, with conditional header)
-  const res = await apiFetch('/kb/export?include_vectors=true', activeUrl, {
-    headers: storedEtag ? { 'If-None-Match': storedEtag } : {},
+  const res = await fetch(`${activeUrl}/kb/export?include_vectors=true`, {
+    headers: {
+      'Content-Type': 'application/json',
+      ...(storedEtag ? { 'If-None-Match': storedEtag } : {}),
+    },
   });
 
-  let chunksResult = { count: 0, vectors: 0, skipped: false };
+  let chunksSkipped = false;
+  let receivedChunks = 0;
+  let receivedVectors = 0; // count from JSON payload (what server sent)
 
   if (res.status === 304) {
-    // Nothing changed on server — skip chunk + vector sync
-    chunksResult.skipped = true;
+    chunksSkipped = true;
     console.log('[SYNC] 304 Not Modified — chunks unchanged, skipping DB write');
 
   } else if (res.ok) {
-    const data    = await res.json();
-    const chunks  = data.chunks || [];
+    const data   = await res.json();
+    const chunks = data.chunks || [];
     const newEtag = data.etag || res.headers.get('X-Export-Etag') || '';
 
-    // 3. Atomic replace: chunks + FTS + vectors
+    receivedChunks  = chunks.length;
+    // FIX: this only counts what arrived — does NOT mean they were stored correctly
+    receivedVectors = chunks.filter(c => Array.isArray(c.embedding) && c.embedding.length > 0).length;
+
+    console.log(`[SYNC] Received ${receivedChunks} chunks, ${receivedVectors} with embeddings from server`);
+
+    // Validate embedding shape BEFORE writing — surfaces db.js Float32Array issues
+    validateAndLogEmbeddings(chunks);
+
+    // Atomic replace: chunks + FTS + vectors
+    // db.js MUST convert embedding: number[] → Float32Array buffer for sqlite-vec
     await replaceAllChunksWithVectors(chunks);
 
-    // 4. Persist new etag so next sync can delta-check
     if (newEtag) await setSyncMeta('export_etag', newEtag);
 
-    chunksResult = {
-      count:   chunks.length,
-      vectors: chunks.filter(c => c.embedding).length,
-      skipped: false,
-    };
-
   } else {
-    throw new Error(`/kb/export failed: ${res.status}`);
+    throw new Error(`/kb/export failed: HTTP ${res.status}`);
   }
 
-  // 5. PDF sync — always runs (tracked independently of chunk etag)
+  // PDF sync — always runs regardless of chunk etag
   const pdfResult = await syncPdfs(activeUrl);
 
-  // 6. Persist sync metadata
+  // Read actual stored counts from DB — ground truth after the write
+  // FIX: use these values, not the received counts, for reporting
+  const [storedChunks, storedVectors] = await Promise.all([
+    getChunkCount(),
+    getVectorCount(),
+  ]);
+
+  // Persist sync metadata
   await setSyncMeta('last_synced',  new Date().toISOString());
-  await setSyncMeta('chunk_count',  String(await getChunkCount()));
-  await setSyncMeta('vector_count', String(await getVectorCount()));
+  await setSyncMeta('chunk_count',  String(storedChunks));
+  await setSyncMeta('vector_count', String(storedVectors));
+
+  // FIX: log received vs stored side by side — any mismatch = db.js write bug
+  if (!chunksSkipped) {
+    console.log(
+      `[SYNC] DB write complete — ` +
+      `chunks: received=${receivedChunks} stored=${storedChunks} | ` +
+      `vectors: received=${receivedVectors} stored=${storedVectors}`
+    );
+
+    if (receivedVectors > 0 && storedVectors === 0) {
+      console.error(
+        '[SYNC] ✗ Vector storage failure — received embeddings but stored 0. ' +
+        'Fix: in db.js replaceAllChunksWithVectors(), convert embedding to ' +
+        'new Float32Array(chunk.embedding).buffer before inserting into vec_chunks.'
+      );
+    } else if (storedVectors < receivedVectors) {
+      console.warn(
+        `[SYNC] ⚠ Partial vector loss — received ${receivedVectors}, stored ${storedVectors}. ` +
+        `Check for per-row errors in replaceAllChunksWithVectors().`
+      );
+    } else {
+      console.log(`[SYNC] ✅ Vectors stored correctly (${storedVectors}/${receivedVectors})`);
+    }
+  }
 
   return {
-    chunks:        chunksResult.count,
-    vectors:       chunksResult.vectors,
-    chunksSkipped: chunksResult.skipped,
+    chunks:        storedChunks,   // FIX: ground truth from DB, not JSON payload count
+    vectors:       storedVectors,  // FIX: ground truth from DB, not JSON payload count
+    chunksSkipped,
     pdfsSynced:    pdfResult.synced.length,
     pdfsDeleted:   pdfResult.deleted.length,
     errors:        pdfResult.errors,
@@ -165,18 +223,6 @@ async function syncFromServer(activeUrl) {
 // HOOK: useOfflineSearch
 // ─────────────────────────────────────────────────────────────
 
-/**
- * useOfflineSearch(mode, activeUrl)
- *
- * Automatically syncs local SQLite when:
- *   Effect 1: mode transitions from deep_offline → reachable
- *   Effect 2: activeUrl changes from empty → non-empty (first server contact)
- *   Effect 3 (P5): fixed 10-min polling while server is reachable
- *
- * Returns:
- *   syncStatus  — { isSyncing, lastSynced, chunkCount, vectorCount, lastResult }
- *   triggerSync — force an immediate sync (used by SettingsScreen manual button)
- */
 export function useOfflineSearch(mode, activeUrl = '') {
   const [syncStatus, setSyncStatus] = useState({
     isSyncing:   false,
@@ -188,9 +234,9 @@ export function useOfflineSearch(mode, activeUrl = '') {
 
   const prevMode      = useRef(null);
   const prevActiveUrl = useRef('');
-  const isSyncingRef  = useRef(false); // prevents concurrent syncs
+  const isSyncingRef  = useRef(false);
 
-  // Load persisted sync state on mount
+  // Load persisted state on mount
   useEffect(() => {
     (async () => {
       try {
@@ -204,13 +250,11 @@ export function useOfflineSearch(mode, activeUrl = '') {
     })();
   }, []);
 
-  // P5: triggerSync accepts { force } to bypass stale check
   const triggerSync = useCallback(async (urlOverride, opts = {}) => {
     if (isSyncingRef.current) return;
     const url = urlOverride || activeUrl;
     if (!url) return;
 
-    // Stale check unless force=true
     if (!opts.force) {
       const needed = await shouldSync();
       if (!needed) {
@@ -224,20 +268,25 @@ export function useOfflineSearch(mode, activeUrl = '') {
 
     try {
       const result = await syncFromServer(url);
-      const [count, vcount] = await Promise.all([getChunkCount(), getVectorCount()]);
+
+      // FIX: result.chunks and result.vectors are now DB ground-truth values
       setSyncStatus(s => ({
         ...s,
         isSyncing:   false,
         lastSynced:  new Date().toISOString(),
-        chunkCount:  count,
-        vectorCount: vcount,
+        chunkCount:  result.chunks,
+        vectorCount: result.vectors,
         lastResult:  result,
       }));
+
+      // FIX: log shows stored counts, not received counts
       console.log(
-        `[useOfflineSearch] Sync complete — ${result.chunks} chunks, ` +
-        `${result.vectors} vectors, ${result.pdfsSynced} PDFs` +
+        `[useOfflineSearch] Sync complete — ` +
+        `${result.chunks} chunks, ${result.vectors} vectors, ` +
+        `${result.pdfsSynced} PDFs` +
         (result.chunksSkipped ? ' (304 — data unchanged)' : '')
       );
+
     } catch (err) {
       console.warn('[useOfflineSearch] Sync failed:', err.message);
       setSyncStatus(s => ({
@@ -250,27 +299,20 @@ export function useOfflineSearch(mode, activeUrl = '') {
     }
   }, [activeUrl]);
 
-  // ── Effect 1: Sync on mode transition from deep_offline → reachable ──────
+  // Effect 1: mode transition deep_offline → reachable
   useEffect(() => {
-    const prev           = prevMode.current;
-    const isNowReachable = (
-      mode === NetworkMode.FULL_ONLINE ||
-      mode === NetworkMode.INTRANET_ONLY
-    );
-    const wasOffline = (
-      prev === NetworkMode.DEEP_OFFLINE ||
-      prev === null // initial mount — treat as coming from offline
-    );
+    const prev          = prevMode.current;
+    const isNowReachable = mode === NetworkMode.FULL_ONLINE || mode === NetworkMode.INTRANET_ONLY;
+    const wasOffline     = prev === NetworkMode.DEEP_OFFLINE || prev === null;
 
     if (isNowReachable && wasOffline && activeUrl) {
       console.log('[useOfflineSearch] Mode became reachable — triggering sync');
       triggerSync(activeUrl);
     }
-
     prevMode.current = mode;
   }, [mode, activeUrl, triggerSync]);
 
-  // ── Effect 2: Sync when activeUrl becomes available for first time ────────
+  // Effect 2: activeUrl first becomes available
   useEffect(() => {
     if (activeUrl && !prevActiveUrl.current) {
       console.log('[useOfflineSearch] Backend URL became available — triggering sync');
@@ -279,30 +321,21 @@ export function useOfflineSearch(mode, activeUrl = '') {
     prevActiveUrl.current = activeUrl;
   }, [activeUrl, triggerSync]);
 
-  // ── Effect 3 (P5): Fixed-interval polling while server is reachable ───────
-  // 304 responses cost ~50 bytes — safe to poll every 10 minutes.
+  // Effect 3: 10-min polling while reachable
   useEffect(() => {
-    const isReachable = (
-      mode === NetworkMode.FULL_ONLINE ||
-      mode === NetworkMode.INTRANET_ONLY
-    );
+    const isReachable = mode === NetworkMode.FULL_ONLINE || mode === NetworkMode.INTRANET_ONLY;
     if (!isReachable || !activeUrl) return;
 
     const poll = () => {
-      if (isSyncingRef.current) return; // already running, skip this tick
+      if (isSyncingRef.current) return;
       console.log('[useOfflineSearch] Poll tick — checking for updates');
-      triggerSync(activeUrl); // triggerSync itself checks shouldSync() internally
+      triggerSync(activeUrl);
     };
 
-    // First poll delayed by 60s — Effects 1/2 handle the immediate sync on connect
     const initialDelay = setTimeout(poll, 60_000);
     const interval     = setInterval(poll, POLL_INTERVAL_MS);
-
-    return () => {
-      clearTimeout(initialDelay);
-      clearInterval(interval);
-    };
-  }, [mode, activeUrl, triggerSync]); // re-creates on mode/url change
+    return () => { clearTimeout(initialDelay); clearInterval(interval); };
+  }, [mode, activeUrl, triggerSync]);
 
   return { syncStatus, triggerSync };
 }
