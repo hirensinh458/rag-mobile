@@ -18,7 +18,6 @@
         "expo-build-properties",
         {
           "android": {
-            "newArchEnabled": false,
             "extraMavenRepos": ["https://repo1.maven.org/maven2/"],
             "extraProguardRules": "-keep class ai.onnxruntime.** { *; }",
             "packagingOptions": {
