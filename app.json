@@ -20,7 +20,15 @@
           "android": {
             "newArchEnabled": false,
             "extraMavenRepos": ["https://repo1.maven.org/maven2/"],
-            "extraProguardRules": "-keep class ai.onnxruntime.** { *; }"
+            "extraProguardRules": "-keep class ai.onnxruntime.** { *; }",
+            "packagingOptions": {
+              "pickFirst": [
+                "lib/arm64-v8a/libreactnative.so",
+                "lib/x86_64/libreactnative.so",
+                "lib/armeabi-v7a/libreactnative.so",
+                "lib/x86/libreactnative.so"
+              ]
+            }
           }
         }
       ],
