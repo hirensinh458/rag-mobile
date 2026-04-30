@@ -3,12 +3,18 @@
     "development": {
       "developmentClient": true,
       "distribution": "internal",
-      "android": { "buildType": "apk" }
+      "android": { "buildType": "apk" },
+      "hooks": {
+        "pre-install": ".eas/build/pre-install.sh"
+      }
     },
     "production": {
       "android": {
         "buildType": "apk",
         "gradleCommand": ":app:assembleRelease"
+      },
+      "hooks": {
+        "pre-install": ".eas/build/pre-install.sh"
       }
     }
   }
