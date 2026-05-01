@@ -96,7 +96,7 @@ async function embed(text) {
   const { inputIds, attentionMask, tokenTypeIds } = await _tokenize(text);
 
   const feeds = {
-    input_ids:      toInt64Buffer(inputIds),
+    input_ids: toInt64Buffer(inputIds),
     attention_mask: toInt64Buffer(attentionMask),
     token_type_ids: toInt64Buffer(tokenTypeIds),
   };
@@ -106,8 +106,8 @@ async function embed(text) {
     : _session.run(feeds);
 
   const outputKey = _session.outputNames?.[0]?.name
-                 ?? _session.outputNames?.[0]
-                 ?? 'last_hidden_state';
+    ?? _session.outputNames?.[0]
+    ?? 'last_hidden_state';
 
   const rawBuffer = results[outputKey];
   if (!rawBuffer) {
@@ -117,37 +117,46 @@ async function embed(text) {
     );
   }
 
-  // hidden shape is [1, seq_len, 384] flattened → length = seq_len * 384
+  // src/offline/embedder.js — replace everything after rawBuffer check
+
   const hidden = new Float32Array(rawBuffer);
-  const seqLen = inputIds.length;       // actual token count
-  const DIM    = 384;
+  const DIM = 384;
 
-  if (hidden.length < seqLen * DIM) {
-    throw new Error(`[EMBEDDER] Output shape mismatch: got ${hidden.length}, expected ${seqLen * DIM}`);
-  }
+  let embedding;
 
-  // ── MEAN POOLING (attention-mask weighted) ──────────────────
-  // BGE-small is trained with mean pooling, NOT CLS-only.
-  // We weight each token's vector by its attention mask value
-  // so padding tokens (mask=0) contribute nothing to the mean.
-  const meanVec    = new Float32Array(DIM);
-  let   maskedCount = 0;
+  if (hidden.length === DIM) {
+    // Model already outputs a pooled [384] vector — use it directly
+    console.log('[Embedder] Model has built-in pooling, skipping mean pool');
+    embedding = hidden;
+  } else {
+    // Full hidden state [seq_len, 384] — do mean pooling ourselves
+    const seqLen = inputIds.length;
 
-  for (let pos = 0; pos < seqLen; pos++) {
-    const mask = attentionMask[pos]; // 1 for real token, 0 for pad
-    if (mask === 0) continue;
-    maskedCount++;
-    for (let dim = 0; dim < DIM; dim++) {
-      meanVec[dim] += hidden[pos * DIM + dim];
+    if (hidden.length < seqLen * DIM) {
+      throw new Error(`[EMBEDDER] Output shape mismatch: got ${hidden.length}, expected ${seqLen * DIM}`);
     }
-  }
-  for (let dim = 0; dim < DIM; dim++) {
-    meanVec[dim] /= maskedCount || 1;
+
+    const meanVec = new Float32Array(DIM);
+    let maskedCount = 0;
+
+    for (let pos = 0; pos < seqLen; pos++) {
+      const mask = attentionMask[pos];
+      if (mask === 0) continue;
+      maskedCount++;
+      for (let dim = 0; dim < DIM; dim++) {
+        meanVec[dim] += hidden[pos * DIM + dim];
+      }
+    }
+    for (let dim = 0; dim < DIM; dim++) {
+      meanVec[dim] /= maskedCount || 1;
+    }
+
+    embedding = meanVec;
   }
 
   // ── L2 NORMALISE ───────────────────────────────────────────
-  const norm = Math.sqrt(meanVec.reduce((s, v) => s + v * v, 0));
-  return Float32Array.from(meanVec, v => v / (norm || 1));
+  const norm = Math.sqrt(embedding.reduce((s, v) => s + v * v, 0));
+  return Float32Array.from(embedding, v => v / (norm || 1));
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -156,6 +165,17 @@ async function embed(text) {
 
 export function cosineSim(a, b) {
   let dot = 0;
-  for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  return dot;
+  let magA = 0;
+  let magB = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    magA += a[i] * a[i];
+    magB += b[i] * b[i];
+  }
+
+  magA = Math.sqrt(magA);
+  magB = Math.sqrt(magB);
+
+  return dot / (magA * magB);
 }
