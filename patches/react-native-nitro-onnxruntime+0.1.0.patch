@@ -1,0 +1,17 @@
+diff --git a/node_modules/react-native-nitro-onnxruntime/react-native.config.js b/node_modules/react-native-nitro-onnxruntime/react-native.config.js
+new file mode 100644
+index 0000000..b1bcdfa
+--- /dev/null
++++ b/node_modules/react-native-nitro-onnxruntime/react-native.config.js
+@@ -0,0 +1,10 @@
++module.exports = {
++  dependency: {
++    platforms: {
++      android: {
++        packageImportPath: 'import com.nitroonnxruntime.NitroOnnxruntimePackage;',
++        packageInstance: 'new NitroOnnxruntimePackage()',
++      },
++    },
++  },
++};
+\ No newline at end of file
