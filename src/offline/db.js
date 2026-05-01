@@ -256,7 +256,7 @@ export const replaceAllChunks = replaceAllChunksWithVectors;
 // P4: HYBRID SEARCH — BM25 + KNN + RRF
 // ─────────────────────────────────────────────────────────────
 
-const RRF_K = 60;
+const RRF_K = 10;
 
 function rrfMerge(resultLists, topK) {
   const scores = new Map();

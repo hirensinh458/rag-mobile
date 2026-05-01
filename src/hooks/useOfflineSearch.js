@@ -31,6 +31,7 @@ import {
 } from '../offline/db';
 import { getEmbedder } from '../offline/embedder';
 import { syncPdfs } from '../offline/pdfSync';
+import { getReranker } from '../offline/reranker';
 
 const SYNC_STALE_MS    = 10 * 60 * 1000;
 const POLL_INTERVAL_MS = 10 * 60 * 1000;
@@ -40,6 +41,7 @@ const POLL_INTERVAL_MS = 10 * 60 * 1000;
 // ─────────────────────────────────────────────────────────────
 
 let _embedder = null;
+let _reranker = null;
 
 async function getLocalEmbedder() {
   if (_embedder) return _embedder;
@@ -57,15 +59,47 @@ async function getLocalEmbedder() {
 // P4: localSearch — called by useChat.js in Mode 3
 // ─────────────────────────────────────────────────────────────
 
+async function getLocalReranker() {
+  if (_reranker) return _reranker;
+  try {
+    _reranker = await getReranker();
+    console.log('[useOfflineSearch] Cross-encoder reranker ready');
+  } catch (e) {
+    console.warn('[useOfflineSearch] Reranker unavailable:', e.message);
+    _reranker = null;
+  }
+  return _reranker;
+}
+
+// ─── replace localSearch entirely ────────────────────────────
 export async function localSearch(query, topK = 5) {
+  // Step 1 — embed query for KNN
   let queryVec = null;
   try {
     const embedder = await getLocalEmbedder();
     if (embedder) queryVec = await embedder.embed(query);
   } catch (e) {
-    console.warn('[useOfflineSearch] Embed failed, using BM25 only:', e.message);
+    console.warn('[useOfflineSearch] Embed failed, BM25 only:', e.message);
   }
-  return hybridSearchChunks(query, queryVec, topK);
+
+  // Step 2 — hybrid retrieve: get more candidates than topK
+  //          so the reranker has material to work with
+  const RETRIEVE_K = Math.max(topK * 4, 20);  // e.g. topK=5 → fetch 20
+  const candidates = await hybridSearchChunks(query, queryVec, RETRIEVE_K);
+
+  // Step 3 — rerank if available, then slice to topK
+  try {
+    const reranker = await getLocalReranker();
+    if (reranker && candidates.length > 0) {
+      const reranked = await reranker.rerank(query, candidates);
+      return reranked.slice(0, topK);
+    }
+  } catch (e) {
+    console.warn('[useOfflineSearch] Reranker failed, using RRF order:', e.message);
+  }
+
+  // Fallback: return RRF-ordered results without reranking
+  return candidates.slice(0, topK);
 }
 
 // ─────────────────────────────────────────────────────────────
