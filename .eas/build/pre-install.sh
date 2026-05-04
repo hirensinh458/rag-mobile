@@ -27,34 +27,28 @@ if [ "$FILE_SIZE" -lt 10000000 ]; then
   exit 1
 fi
 
-# ── Download correct FP32 non-quantized cross‑encoder ONNX ─────
+# ── Download correct FP32 non‑quantized cross‑encoder ONNX ─────
 RERANKER_PATH="assets/models/reranker.onnx"
-RERANKER_ZIP="assets/models/ms-marco-MiniLM-L-6-v2-onnx.zip"
-RERANKER_TEMP="assets/models/_reranker_extract"
+# SHA256 of the CORRECT model (pre‑computed from the svilupp zip)
+EXPECTED_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
-if [ ! -f "$RERANKER_PATH" ]; then
-  echo "[pre-install] Downloading correct reranker ONNX (FP32, ~83MB)..."
-  mkdir -p "$MODEL_DIR" "$RERANKER_TEMP"
+echo "[pre-install] Removing any old reranker.onnx to force fresh download"
+rm -f "$RERANKER_PATH"
 
-  curl -L --retry 3 --retry-delay 5 --progress-bar \
-    "https://huggingface.co/svilupp/onnx-cross-encoders/resolve/main/ms-marco-MiniLM-L-6-v2-onnx.zip" \
-    -o "$RERANKER_ZIP"
+echo "[pre-install] Downloading correct reranker ONNX (FP32, ~83MB)..."
+mkdir -p "$MODEL_DIR"
 
-  unzip -o "$RERANKER_ZIP" -d "$RERANKER_TEMP"
+curl -L --retry 5 --retry-delay 10 --progress-bar \
+  "https://huggingface.co/svilupp/onnx-cross-encoders/resolve/main/ms-marco-MiniLM-L-6-v2-onnx.zip" \
+| funzip | tar -xO '*/ms-marco-MiniLM-L-6-v2.onnx' > "$RERANKER_PATH"
 
-  # Find the .onnx file inside the extracted folder
-  ONNX_FILE=$(find "$RERANKER_TEMP" -name "*.onnx" | head -1)
-  if [ -z "$ONNX_FILE" ]; then
-    echo "[pre-install] ❌ FATAL: No .onnx file found in zip"
-    exit 1
-  fi
-
-  cp "$ONNX_FILE" "$RERANKER_PATH"
-  rm -rf "$RERANKER_TEMP" "$RERANKER_ZIP"
-  echo "[pre-install] ✅ FP32 reranker extracted"
-else
-  echo "[pre-install] ✅ reranker.onnx already present, skipping"
+# Verify size
+FILE_SIZE=$(wc -c < "$RERANKER_PATH")
+if [ "$FILE_SIZE" -lt 80000000 ]; then
+  echo "[pre-install] ❌ FATAL: reranker.onnx is too small (${FILE_SIZE} bytes)"
+  exit 1
 fi
+echo "[pre-install] ✅ FP32 reranker downloaded: ${FILE_SIZE} bytes"
 
 # ── Verify reranker isn't corrupted (should be ~85MB) ────────────
 FILE_SIZE=$(wc -c < "$RERANKER_PATH")

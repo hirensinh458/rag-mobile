@@ -147,15 +147,9 @@ async function _tokenizePair(query, chunkText) {
 // HELPER
 // ─────────────────────────────────────────────────────────────
 
-// REPLACE the existing toInt64Buffer function with:
 function toInt64Buffer(arr) {
-    /**
-     * Mobile ONNX runtimes (including react-native-nitro-onnxruntime) do NOT
-     * reliably support BigInt64Array / int64 inputs.  Token IDs fit comfortably
-     * in 32-bit integers, so we use Int32Array, which is universally supported.
-     */
-    const buf = new Int32Array(arr.length);
-    for (let i = 0; i < arr.length; i++) buf[i] = arr[i];
+    const buf = new BigInt64Array(arr.length);
+    for (let i = 0; i < arr.length; i++) buf[i] = BigInt(arr[i]);
     return buf.buffer;
 }
 
