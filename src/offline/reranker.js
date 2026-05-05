@@ -172,6 +172,34 @@ async function _initSession() {
   log.info('_initSession() — creating ONNX session from:', modelPath);
   _session = await createModelLoader({ filePath: modelPath });
 
+  // ── DIAGNOSTIC: test the model with two fixed sentences ──
+  try {
+    const testPairs = [
+      ['a dog is running', 'a cat is sleeping'],
+      ['a dog is running', 'the ship engine needs maintenance'],
+    ];
+    const tokenizer = await import('./tokenizer');
+    for (const [q, c] of testPairs) {
+      const [qTok, cTok] = await Promise.all([
+        tokenizer.tokenize(q, { addSpecialTokens: false }),
+        tokenizer.tokenize(c, { addSpecialTokens: false }),
+      ]);
+      const inputIds = [101, ...qTok, 102, ...cTok.slice(0, 512 - qTok.length - 3), 102];
+      const tokenTypeIds = [0, ...new Array(qTok.length).fill(0), 0, ...new Array(cTok.length).fill(1), 1];
+      const attentionMask = new Array(inputIds.length).fill(1);
+      const feeds = {
+        input_ids: new BigInt64Array(inputIds).buffer,
+        attention_mask: new BigInt64Array(attentionMask.map(() => 1)).buffer,
+        token_type_ids: new BigInt64Array(tokenTypeIds).buffer,
+      };
+      const results = _session.runAsync ? await _session.runAsync(feeds) : _session.run(feeds);
+      const logits = new Float32Array(results[Object.keys(results)[0]]);
+      log.info(`DIAGNOSTIC test score for "${q}" vs "${c}": ${logits[0]}`);
+    }
+  } catch (e) {
+    log.error('DIAGNOSTIC test failed:', e.message);
+  }
+
   // Log node names — if output contains 'hidden_state', model has no head
   const inputNames  = _session.inputNames  ?? [];
   const outputNames = _session.outputNames ?? [];

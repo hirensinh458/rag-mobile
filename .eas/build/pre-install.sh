@@ -42,7 +42,7 @@ curl -L \
   --retry 3 \
   --retry-delay 5 \
   --progress-bar \
-  "https://huggingface.co/Xenova/ms-marco-TinyBERT-L-2-v2/resolve/main/onnx/model.onnx" \
+  "https://huggingface.co/ProTiger123/tinybert-reranker-seq128/resolve/main/onnx/model.onnx" \
   -o "$RERANKER_PATH"
 
 FILE_SIZE=$(wc -c < "$RERANKER_PATH")
