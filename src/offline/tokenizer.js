@@ -136,8 +136,10 @@ function wordpiece(word) {
  * @param {string} text
  * @returns {Promise<number[]>} — length 128 array of token IDs
  */
-export async function tokenize(text) {
+export async function tokenize(text, opts = {}) {
   await loadVocab();
+
+  const addSpecialTokens = opts.addSpecialTokens !== false;
 
   log.debug('tokenize() — input length:', text.length, '| preview:', text.slice(0, 60));
 
@@ -151,37 +153,40 @@ export async function tokenize(text) {
   const words = clean.split(' ').filter(Boolean);
   log.debug('tokenize() — word count after normalisation:', words.length);
 
-  const ids = [CLS_ID];
+  const ids = addSpecialTokens ? [CLS_ID] : [];
   let unkCount = 0;
 
+  const maxLen = addSpecialTokens ? MAX_SEQ - 1 : MAX_SEQ; // leave room for SEP if special tokens enabled
+
   for (const word of words) {
-    if (ids.length >= MAX_SEQ - 1) {
+    if (ids.length >= maxLen) {
       log.debug('tokenize() — MAX_SEQ reached, truncating remaining words');
-      break; // leave room for SEP
+      break;
     }
     const pieces = wordpiece(word);
     if (pieces.length === 1 && pieces[0] === UNK_ID) unkCount++;
     for (const id of pieces) {
-      if (ids.length >= MAX_SEQ - 1) break;
+      if (ids.length >= maxLen) break;
       ids.push(id);
     }
   }
 
-  ids.push(SEP_ID);
+  if (addSpecialTokens) {
+    ids.push(SEP_ID);
+    // Right-pad with PAD_ID
+    while (ids.length < MAX_SEQ) ids.push(PAD_ID);
+    ids.splice(MAX_SEQ);
+  }
 
-  // Right-pad with PAD_ID
-  while (ids.length < MAX_SEQ) ids.push(PAD_ID);
-
-  const finalIds = ids.slice(0, MAX_SEQ);
-
+  // Logging
   log.info('tokenize() DONE', {
     inputWords:   words.length,
-    outputTokens: finalIds.filter(id => id !== PAD_ID).length, // non-padding
+    outputTokens: addSpecialTokens ? ids.filter(id => id !== PAD_ID).length : ids.length,
     unkTokens:    unkCount,
-    totalLength:  finalIds.length,
+    totalLength:  ids.length,
   });
 
-  return finalIds;
+  return ids;
 }
 
 /**

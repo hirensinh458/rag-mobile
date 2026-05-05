@@ -46,7 +46,8 @@ curl -L \
   -o "$RERANKER_PATH"
 
 FILE_SIZE=$(wc -c < "$RERANKER_PATH")
-if [ "$FILE_SIZE" -lt 80000000 ]; then
+# Accept sizes >= 15 MB (actual Xenova model is ~17.6 MB)
+if [ "$FILE_SIZE" -lt 15000000 ]; then
   echo "[pre-install] ❌ FATAL: reranker.onnx too small (${FILE_SIZE} bytes)"
   exit 1
 fi
