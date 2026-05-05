@@ -109,7 +109,7 @@ export async function localSearch(query, topK = 5) {
 
   // Step 2 — hybrid retrieve: get more candidates than topK
   //          so the reranker has material to work with
-  const RETRIEVE_K = Math.max(topK * 4, 20);  // e.g. topK=5 → fetch 20
+  const RETRIEVE_K = Math.max(topK * 2, 10);  // e.g. topK=5 → fetch 20
   log.info('localSearch() STEP 2 — hybridSearchChunks()', {
     query: query.slice(0, 80),
     hasQueryVec: queryVec !== null,
@@ -126,23 +126,23 @@ export async function localSearch(query, topK = 5) {
   }
 
   // Step 3 — rerank if available, then slice to topK
-  try {
-    log.debug('localSearch() STEP 3 — loading reranker …');
-    const reranker = await getLocalReranker();
-    if (reranker && candidates.length > 0) {
-      log.info('localSearch() STEP 3 — reranking', candidates.length, 'candidates …');
-      const reranked = await reranker.rerank(query, candidates);
-      const result   = reranked.slice(0, topK);
-      log.info('localSearch() STEP 3 ✅ reranked — returning top', result.length,
-        'in', Date.now() - startMs, 'ms total |',
-        result.map(c => `${c.source}:p${c.page}(${c.rerankerScore?.toFixed(3) ?? c.score?.toFixed(3)})`).join(', '));
-      return result;
-    } else {
-      log.warn('localSearch() STEP 3 ⚠ Reranker unavailable — using RRF order');
-    }
-  } catch (e) {
-    log.warn('localSearch() STEP 3 reranker FAILED — using RRF order:', e.message);
-  }
+  // try {
+  //   log.debug('localSearch() STEP 3 — loading reranker …');
+  //   const reranker = await getLocalReranker();
+  //   if (reranker && candidates.length > 0) {
+  //     log.info('localSearch() STEP 3 — reranking', candidates.length, 'candidates …');
+  //     const reranked = await reranker.rerank(query, candidates);
+  //     const result   = reranked.slice(0, topK);
+  //     log.info('localSearch() STEP 3 ✅ reranked — returning top', result.length,
+  //       'in', Date.now() - startMs, 'ms total |',
+  //       result.map(c => `${c.source}:p${c.page}(${c.rerankerScore?.toFixed(3) ?? c.score?.toFixed(3)})`).join(', '));
+  //     return result;
+  //   } else {
+  //     log.warn('localSearch() STEP 3 ⚠ Reranker unavailable — using RRF order');
+  //   }
+  // } catch (e) {
+  //   log.warn('localSearch() STEP 3 reranker FAILED — using RRF order:', e.message);
+  // }
 
   // Fallback: return RRF-ordered results without reranking
   const result = candidates.slice(0, topK);
