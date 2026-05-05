@@ -42,12 +42,12 @@ curl -L \
   --retry 3 \
   --retry-delay 5 \
   --progress-bar \
-  "https://huggingface.co/ProTiger123/tinybert-reranker-seq128/resolve/main/onnx/model.onnx" \
+  "https://huggingface.co/ProTiger123/tinybert-reranker-seq128/resolve/main/model.onnx" \
   -o "$RERANKER_PATH"
 
 FILE_SIZE=$(wc -c < "$RERANKER_PATH")
 # Accept sizes >= 15 MB (actual Xenova model is ~17.6 MB)
-if [ "$FILE_SIZE" -lt 10000000 ]; then
+if [ "$FILE_SIZE" -lt 15000000 ]; then
   echo "[pre-install] ❌ FATAL: reranker.onnx too small (${FILE_SIZE} bytes)"
   exit 1
 fi
