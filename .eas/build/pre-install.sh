@@ -63,6 +63,7 @@ echo "[pre-install] ✅ Custom TinyBERT reranker: ${FILE_SIZE} bytes"
 # This prevents ever shipping a broken reranker to users.
 echo "[pre-install] Verifying reranker classification head..."
 
+pip3 install --quiet onnxruntime numpy 2>/dev/null || true
 python3 - "$RERANKER_PATH" << 'PYEOF'
 import sys, numpy as np
 
