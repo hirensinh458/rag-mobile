@@ -2,6 +2,8 @@ const { getDefaultConfig } = require('expo/metro-config');
 
 const config = getDefaultConfig(__dirname);
 
+config.resolver.assetExts.push('onnx');
+
 // Tell Metro to handle these extensions as assets (not parse them)
 config.resolver.assetExts.push('onnx', 'bin', 'dylib', 'txt');
 
