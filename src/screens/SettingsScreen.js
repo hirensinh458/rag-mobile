@@ -1,103 +1,143 @@
-// src/screens/SettingsScreen.js  — P5: Added vector count stat + Force Sync button
+// src/screens/SettingsScreen.js  — P5 (reconciled) + SyncContext wiring
 //
-// CHANGES FROM PREVIOUS VERSION:
-//   - vectorCount state added; populated from getVectorCount() after each sync
-//   - "Vectors (sqlite-vec)" stat row shown in Local Database card
-//   - "⚡ Force Full Sync" button added (bypasses stale check, for debugging)
-//   - triggerSync() called with { force: true } from the Force Sync button
-//   - Sync result text updated to show vector count
-//   - About text updated to reflect hybrid Mode 3
+// SYNC FIX: no longer receives triggerSync / syncStatus as props or route params.
+// Both are read directly from SyncContext (which AppNavigator provides).
+// This means the sync buttons work regardless of how the screen is reached
+// (tab tap vs ⚙ button) and triggerSync is never a stale closure.
 
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
-  ScrollView, StyleSheet, ActivityIndicator,
+  StyleSheet, ScrollView, ActivityIndicator,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { invalidateUrlCache } from '../api/client';
+import AsyncStorage          from '@react-native-async-storage/async-storage';
 import { fetchHealth, fetchStats } from '../api/kb';
-import { useOfflineSearch }       from '../hooks/useOfflineSearch';
-import { getChunkCount, getVectorCount } from '../offline/db';
+import { invalidateUrlCache }      from '../api/client';
+import { getChunkCount, getVectorCount, getAllSyncMeta } from '../offline/db';
+import { useSyncContext }           from '../context/SyncContext';
+import { Config }                  from '../config';
 import { colors, spacing, radius, typography, minTapTarget } from '../config/theme';
 
+const normalizeUrl = (value) => (value || '').trim();
+
 export function SettingsScreen() {
+  // Live sync state + trigger from the single shared hook instance
+  const { syncStatus, triggerSync } = useSyncContext();
+
   const [cloudUrl,     setCloudUrl]     = useState('');
   const [localUrl,     setLocalUrl]     = useState('');
-  const [saveFeedback, setSaveFeedback] = useState('');
-  const [checking,     setChecking]     = useState(false);
   const [health,       setHealth]       = useState(null);
   const [stats,        setStats]        = useState(null);
-  const [syncing,      setSyncing]      = useState(false);
-  const [syncResult,   setSyncResult]   = useState(null);
   const [chunkCount,   setChunkCount]   = useState(null);
-  const [vectorCount,  setVectorCount]  = useState(null);  // P5
+  const [vectorCount,  setVectorCount]  = useState(null);
+  const [checking,     setChecking]     = useState(false);
+  const [saveFeedback, setSaveFeedback] = useState('');
   const [lastSynced,   setLastSynced]   = useState(null);
 
-  // Shared sync hook — we only use triggerSync here (not the auto-sync side)
-  const { triggerSync } = useOfflineSearch('full_online', ''); // mode unused in settings
+  const isSyncing  = syncStatus?.isSyncing   ?? false;
+  const syncResult = syncStatus?.lastResult  ?? null;
 
-  // Get the active URL for manual sync (prefer cloud_url, fall back to local_url)
-  const getActiveUrl = useCallback(async () => {
-    const cloud  = (await AsyncStorage.getItem('cloud_url') || '').trim();
-    const local  = (await AsyncStorage.getItem('local_url') || '').trim();
-    return cloud || local || '';
+  const [activeUrl,    setActiveUrl]    = useState(
+    normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL)
+  );
+  const [activeSource, setActiveSource] = useState('local');
+
+  // ── Mount: load saved URLs + DB counts + last-synced ──
+  useEffect(() => {
+    Promise.all([
+      AsyncStorage.getItem('cloud_url'),
+      AsyncStorage.getItem('local_url'),
+    ]).then(([c, l]) => {
+      setCloudUrl(c || Config.CLOUD_URL || '');
+      setLocalUrl(l || Config.LOCAL_URL || '');
+      setActiveUrl(normalizeUrl(Config.API_BASE_URL || l || Config.LOCAL_URL || Config.CLOUD_URL));
+      setActiveSource('local');
+    });
+
+    Promise.all([getChunkCount(), getVectorCount()])
+      .then(([count, vcount]) => {
+        setChunkCount(count);
+        setVectorCount(vcount);
+      })
+      .catch(() => { setChunkCount(0); setVectorCount(0); });
+
+    getAllSyncMeta()
+      .then(meta => { if (meta.last_synced) setLastSynced(meta.last_synced); })
+      .catch(() => {});
   }, []);
 
-  // Track separate runtime URL for manual sync button
-  const [syncRuntimeUrl, setSyncRuntimeUrl] = useState('');
-
-  // Load saved URLs + DB stats on mount
+  // ── Mirror syncStatus into local display state ──
   useEffect(() => {
-    (async () => {
-      const [cloud, local, count, vcount, ls] = await Promise.all([
-        AsyncStorage.getItem('cloud_url').catch(() => ''),
-        AsyncStorage.getItem('local_url').catch(() => ''),
-        getChunkCount(),
-        getVectorCount(),
-        AsyncStorage.getItem('last_synced_display').catch(() => null),
-      ]);
-      setCloudUrl(cloud  || '');
-      setLocalUrl(local  || '');
-      setChunkCount(count);
-      setVectorCount(vcount);
-      setLastSynced(ls);
+    if (syncStatus?.chunkCount  !== undefined) setChunkCount(syncStatus.chunkCount);
+    if (syncStatus?.vectorCount !== undefined) setVectorCount(syncStatus.vectorCount);
+    if (syncStatus?.lastSynced)               setLastSynced(syncStatus.lastSynced);
+  }, [syncStatus?.chunkCount, syncStatus?.vectorCount, syncStatus?.lastSynced]);
 
-      const url = (cloud || local || '').trim();
-      setSyncRuntimeUrl(url);
-    })();
-  }, []);
-
-  // Refresh DB stats after each sync
-  useEffect(() => {
-    (async () => {
-      const [count, vcount] = await Promise.all([getChunkCount(), getVectorCount()]);
-      setChunkCount(count);
-      setVectorCount(vcount);
-    })();
-  }, [syncResult]);
-
+  // ── URL helpers ──
   const saveUrls = async () => {
-    await AsyncStorage.setItem('cloud_url', cloudUrl.trim());
-    await AsyncStorage.setItem('local_url', localUrl.trim());
+    await Promise.all([
+      AsyncStorage.setItem('cloud_url',  cloudUrl.trim()),
+      AsyncStorage.setItem('local_url',  localUrl.trim()),
+      AsyncStorage.setItem('server_url', localUrl.trim() || cloudUrl.trim()),
+    ]);
     invalidateUrlCache();
-    const url = (cloudUrl.trim() || localUrl.trim());
-    setSyncRuntimeUrl(url);
     setSaveFeedback('Saved ✓');
     setTimeout(() => setSaveFeedback(''), 2000);
   };
 
+  const probeUrl = useCallback(async (url) => {
+    const target = normalizeUrl(url);
+    if (!target) return false;
+    try {
+      const h = await fetchHealth(null, target);
+      return Boolean(h && !h.error && h.is_online !== false);
+    } catch {
+      return false;
+    }
+  }, []);
+
+  const resolvePreferredUrl = useCallback(async () => {
+    const cloud    = normalizeUrl(cloudUrl || Config.CLOUD_URL);
+    const local    = normalizeUrl(localUrl || Config.LOCAL_URL);
+    const fallback = normalizeUrl(Config.API_BASE_URL || Config.LOCAL_URL || local || cloud);
+    if (await probeUrl(cloud)) return { url: cloud,    source: 'cloud'    };
+    if (await probeUrl(local)) return { url: local,    source: 'local'    };
+    return                            { url: fallback, source: 'fallback' };
+  }, [cloudUrl, localUrl, probeUrl]);
+
+  const resolveAndCacheUrl = useCallback(async () => {
+    const resolved = await resolvePreferredUrl();
+    if (resolved.url && resolved.url !== activeUrl) {
+      setActiveUrl(resolved.url);
+      setActiveSource(resolved.source);
+      await AsyncStorage.setItem('server_url', resolved.url);
+      invalidateUrlCache();
+    }
+    return resolved;
+  }, [resolvePreferredUrl, activeUrl]);
+
+  const getActiveUrl = useCallback(() => {
+    return activeUrl || normalizeUrl(
+      Config.API_BASE_URL || Config.LOCAL_URL || localUrl || cloudUrl
+    );
+  }, [activeUrl, localUrl, cloudUrl]);
+
+  // ── Server health check ──
   const checkHealth = async () => {
     setChecking(true);
     setHealth(null);
     setStats(null);
     try {
-      const url    = await getActiveUrl();
-      const [h, s] = await Promise.all([
+      const resolved = await resolveAndCacheUrl();
+      const url      = resolved.url;
+      const [h, s]   = await Promise.all([
         fetchHealth(null, url),
         fetchStats(url).catch(() => null),
       ]);
       setHealth(h);
       setStats(s);
+      setActiveUrl(url);
+      setActiveSource(resolved.source);
     } catch (e) {
       setHealth({ error: e.message });
     } finally {
@@ -105,77 +145,30 @@ export function SettingsScreen() {
     }
   };
 
-  // ── Manual sync (normal — respects stale check) ──
+  // ── Standard sync — respects etag check ──
   const handleSync = useCallback(async () => {
-    if (syncing) return;
-    const url = syncRuntimeUrl || (await getActiveUrl());
-    if (!url) {
-      setSyncResult({ error: 'No server URL configured' });
-      return;
-    }
-    setSyncing(true);
-    setSyncResult(null);
-    try {
-      // We call triggerSync with force=false — same as auto-sync
-      // But we need the result, so we duplicate the inner logic here
-      const { replaceAllChunksWithVectors, setSyncMeta: setMeta, getChunkCount: cc, getVectorCount: vc } =
-        require('../offline/db');
-      const { syncPdfs }  = require('../offline/pdfSync');
-      const { apiFetch: af } = require('../api/client');
-      const { getSyncMeta: gm } = require('../offline/db');
+    if (isSyncing) return;
+    const resolved = await resolveAndCacheUrl();
+    const url      = resolved.url || getActiveUrl();
+    if (!url) return;
+    triggerSync(url, { force: false });
+  }, [isSyncing, resolveAndCacheUrl, getActiveUrl, triggerSync]);
 
-      const storedEtag = await gm('export_etag') || '';
-      const res = await af('/kb/export?include_vectors=true', url, {
-        headers: storedEtag ? { 'If-None-Match': storedEtag } : {},
-      });
-
-      let result;
-      if (res.status === 304) {
-        const pdfRes = await syncPdfs(url);
-        result = { chunks: 0, vectors: 0, chunksSkipped: true, pdfsSynced: pdfRes.synced.length, pdfsDeleted: pdfRes.deleted.length, errors: pdfRes.errors };
-      } else if (res.ok) {
-        const data    = await res.json();
-        const chunks  = data.chunks || [];
-        const newEtag = data.etag || res.headers.get('X-Export-Etag') || '';
-        await replaceAllChunksWithVectors(chunks);
-        if (newEtag) await setMeta('export_etag', newEtag);
-        const pdfRes  = await syncPdfs(url);
-        const count   = await cc();
-        const vcount  = await vc();
-        await setMeta('last_synced', new Date().toISOString());
-        await setMeta('chunk_count', String(count));
-        await setMeta('vector_count', String(vcount));
-        result = { chunks: chunks.length, vectors: chunks.filter(c=>c.embedding).length, chunksSkipped: false, pdfsSynced: pdfRes.synced.length, pdfsDeleted: pdfRes.deleted.length, errors: pdfRes.errors };
-      } else {
-        throw new Error(`/kb/export failed: ${res.status}`);
-      }
-
-      setSyncResult(result);
-      setLastSynced(new Date().toISOString());
-    } catch (e) {
-      setSyncResult({ error: e.message });
-    } finally {
-      setSyncing(false);
-    }
-  }, [syncing, syncRuntimeUrl, getActiveUrl]);
-
-  // ── P5: Force sync (bypasses stale check) ──
+  // ── Force sync — bypasses etag check ──
   const handleForceSync = useCallback(async () => {
-    if (syncing) return;
-    const url = syncRuntimeUrl || (await getActiveUrl());
-    if (!url) { setSyncResult({ error: 'No server URL configured' }); return; }
-    // triggerSync with force=true skips the stale check
-    setSyncing(true);
-    try {
-      await triggerSync(url, { force: true });
-      const [count, vcount] = await Promise.all([getChunkCount(), getVectorCount()]);
-      setSyncResult({ chunks: count, vectors: vcount, chunksSkipped: false, pdfsSynced: 0, pdfsDeleted: 0, errors: [] });
-    } catch(e) {
-      setSyncResult({ error: e.message });
-    } finally {
-      setSyncing(false);
-    }
-  }, [syncing, syncRuntimeUrl, getActiveUrl, triggerSync]);
+    if (isSyncing) return;
+    const resolved = await resolveAndCacheUrl();
+    const url      = resolved.url || getActiveUrl();
+    if (!url) return;
+    triggerSync(url, { force: true });
+  }, [isSyncing, resolveAndCacheUrl, getActiveUrl, triggerSync]);
+
+  // ── Refresh DB counts manually ──
+  const handleRefreshCounts = useCallback(async () => {
+    const [count, vcount] = await Promise.all([getChunkCount(), getVectorCount()]);
+    setChunkCount(count);
+    setVectorCount(vcount);
+  }, []);
 
   const healthColor =
     !health          ? colors.text3 :
@@ -269,13 +262,23 @@ export function SettingsScreen() {
 
       {/* ── Local Database ── */}
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Local Database</Text>
+        {/* Title row with refresh button */}
+        <View style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Text style={styles.cardTitle}>Local Database</Text>
+          <TouchableOpacity
+            onPress={handleRefreshCounts}
+            hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+            activeOpacity={0.6}
+          >
+            <Text style={{ fontSize: 18, color: colors.teal }}>↻</Text>
+          </TouchableOpacity>
+        </View>
+
         <View style={styles.statGrid}>
           <StatRow
             label="Cached chunks"
             value={chunkCount === null ? '…' : chunkCount.toLocaleString()}
           />
-          {/* P5: Vector count stat */}
           <StatRow
             label="Vectors (sqlite-vec)"
             value={vectorCount === null ? '…' : vectorCount.toLocaleString()}
@@ -286,41 +289,46 @@ export function SettingsScreen() {
               value={new Date(lastSynced).toLocaleString()}
             />
           )}
+          {syncStatus?.lastEtag && (
+            <StatRow
+              label="KB version (etag)"
+              value={syncStatus.lastEtag.slice(0, 12) + '…'}
+            />
+          )}
         </View>
 
-        {/* Standard sync — respects stale check */}
+        {/* Standard sync */}
         <TouchableOpacity
           style={[styles.btn, styles.btnSecondary]}
           onPress={handleSync}
-          disabled={syncing}
+          disabled={isSyncing}
           activeOpacity={0.8}
         >
-          {syncing
+          {isSyncing
             ? <ActivityIndicator size="small" color={colors.accent} />
             : <Text style={styles.btnTextSecondary}>⬇  Sync from Server</Text>
           }
         </TouchableOpacity>
 
-        {/* P5: Force sync button — bypasses stale check */}
+        {/* Force sync */}
         <TouchableOpacity
-          style={[styles.btn, styles.btnSecondary, { opacity: syncing ? 0.5 : 1 }]}
+          style={[styles.btn, styles.btnSecondary, { opacity: isSyncing ? 0.5 : 1 }]}
           onPress={handleForceSync}
-          disabled={syncing}
+          disabled={isSyncing}
           activeOpacity={0.8}
         >
           <Text style={styles.btnTextSecondary}>⚡ Force Full Sync</Text>
         </TouchableOpacity>
 
-        {/* Sync result feedback */}
         {syncResult && !syncResult.error && (
           <View style={styles.healthRow}>
             <View style={[styles.healthDot, { backgroundColor: colors.success }]} />
             <Text style={[styles.healthLabel, { color: colors.success }]}>
               {syncResult.chunksSkipped
                 ? 'Up to date (304 — no changes)'
-                : `Synced ${syncResult.chunks.toLocaleString()} chunks · ${syncResult.vectors} vectors`
+                : `Synced ${syncResult.chunks?.toLocaleString()} chunks · ${syncResult.vectors} vectors`
               }
-              {syncResult.pdfsSynced  > 0 ? ` · ${syncResult.pdfsSynced} PDFs` : ''}
+              {syncResult.pdfsSynced  > 0 ? ` · ${syncResult.pdfsSynced} PDFs`    : ''}
               {syncResult.pdfsDeleted > 0 ? ` · ${syncResult.pdfsDeleted} removed` : ''}
             </Text>
           </View>
@@ -364,7 +372,7 @@ function StatRow({ label, value }) {
 }
 
 const statStyles = StyleSheet.create({
-  row:   {
+  row: {
     flexDirection:     'row',
     justifyContent:    'space-between',
     paddingVertical:   spacing.xs,

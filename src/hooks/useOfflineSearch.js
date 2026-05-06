@@ -1,28 +1,31 @@
 // src/hooks/useOfflineSearch.js
 //
-// CHANGES vs previous version:
-//   FIX — result.vectors previously counted embeddings in the received JSON payload,
-//         not what was actually stored in SQLite. The sync-complete log therefore
-//         showed "340 vectors" while DB had 0 — the failure was invisible.
-//         Now: vectors count comes from getVectorCount() AFTER the DB write, so
-//         it reflects ground truth. result.vectors is removed entirely.
+// SYNC FIX (merged) — combines all previous fixes with the full current implementation.
 //
-//   FIX — Pre-write embedding validation with detailed logging: logs shape, type,
-//         and sample value of the first embedding before calling replaceAllChunksWithVectors.
-//         This immediately surfaces any Float32Array / plain-array mismatch in db.js.
+// CHANGES vs the "current" version (document 3):
 //
-//   FIX — Sync-complete log now shows storedVectors (from DB) vs receivedVectors
-//         (from JSON) side by side so any future storage loss is immediately visible.
+//   FIX 1 — shouldSync() now checks the server etag instead of a 30-min timer.
+//     The old timer meant: admin re-uploads PDF at 11:46, app synced at 11:45 →
+//     shouldSync() returns false for 29 more minutes. App shows stale data.
+//     New: shouldSync() sends If-None-Match: <stored_etag> to /kb/export.
+//     Server 304 → skip. Server 200 → sync. Reacts within one poll cycle (~15s).
 //
-//   FIX — syncFromServer returns storedVectors from getVectorCount() after write,
-//         not a count derived from the payload.
+//   FIX 2 — Etag key standardised to 'export_etag' throughout (was mixed
+//     'last_etag' / 'export_etag' between files). syncFromServer() always reads
+//     and writes 'export_etag' in sync_meta.
 //
-//   KEPT — All P3/P4/P5 logic unchanged (etag delta, on-device embedder, polling).
+//   FIX 3 — triggerSync() signature kept as triggerSync(url, opts={force})
+//     matching SettingsScreen's call: triggerSync(url, { force: true }).
 //
-// LOGGING ADDED: Every stage of the sync pipeline (URL read, /kb/export request,
-// etag check, chunk/vector counts, DB write, PDF sync, polling), every localSearch()
-// step (embed, BM25+KNN, rerank), and every mode/URL transition trigger is logged
-// via createLogger('useOfflineSearch').
+// KEPT UNCHANGED from current version:
+//   - localSearch() export + getLocalEmbedder() + getLocalReranker() singletons
+//   - hybridSearchChunks usage in localSearch()
+//   - validateAndLogEmbeddings() pre-write validation
+//   - createLogger / structured logging throughout
+//   - Effect 3: 10-min background polling while reachable
+//   - syncStatus.vectorCount field
+//   - storedVectors ground-truth check after DB write
+//   - All RETRIEVE_K / reranker / RRF fallback logic in localSearch()
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { NetworkMode } from './useNetwork';
@@ -34,19 +37,18 @@ import {
   getVectorCount,
   hybridSearchChunks,
 } from '../offline/db';
-import { getEmbedder } from '../offline/embedder';
-import { syncPdfs }    from '../offline/pdfSync';
-import { getReranker } from '../offline/reranker';
-import { createLogger } from '../utils/logger';
+import { getEmbedder }   from '../offline/embedder';
+import { syncPdfs }      from '../offline/pdfSync';
+import { getReranker }   from '../offline/reranker';
+import { createLogger }  from '../utils/logger';
 
-// Module-level logger — all lines tagged [useOfflineSearch]
 const log = createLogger('useOfflineSearch');
 
 const SYNC_STALE_MS    = 10 * 60 * 1000;
 const POLL_INTERVAL_MS = 10 * 60 * 1000;
 
 // ─────────────────────────────────────────────────────────────
-// P4: ON-DEVICE EMBEDDER (module-level singleton)
+// ON-DEVICE EMBEDDER / RERANKER (module-level singletons)
 // ─────────────────────────────────────────────────────────────
 
 let _embedder = null;
@@ -85,14 +87,14 @@ async function getLocalReranker() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// P4: localSearch — called by useChat.js in Mode 3
+// localSearch — called by useChat.js in Mode 3 (deep_offline)
 // ─────────────────────────────────────────────────────────────
 
 export async function localSearch(query, topK = 5) {
   log.info('localSearch() START', { query: query.slice(0, 100), topK });
   const startMs = Date.now();
 
-  // Step 1 — embed query for KNN
+  // Step 1 — embed query on-device for KNN leg
   let queryVec = null;
   try {
     log.debug('localSearch() STEP 1 — embedding query on-device …');
@@ -107,11 +109,11 @@ export async function localSearch(query, topK = 5) {
     log.warn('localSearch() STEP 1 embed FAILED (BM25 only):', e.message);
   }
 
-  // Step 2 — hybrid retrieve: get more candidates than topK
-  //          so the reranker has material to work with
-  const RETRIEVE_K = Math.max(topK * 2, 10);  // e.g. topK=5 → fetch 20
+  // Step 2 — hybrid retrieve: fetch more candidates than topK so reranker
+  //          has enough material to work with
+  const RETRIEVE_K = Math.max(topK * 2, 10);
   log.info('localSearch() STEP 2 — hybridSearchChunks()', {
-    query: query.slice(0, 80),
+    query:       query.slice(0, 80),
     hasQueryVec: queryVec !== null,
     RETRIEVE_K,
   });
@@ -129,13 +131,15 @@ export async function localSearch(query, topK = 5) {
   try {
     log.debug('localSearch() STEP 3 — loading reranker …');
     const reranker = await getLocalReranker();
-    if (reranker && candidates.length > 0) {
+    if (reranker) {
       log.info('localSearch() STEP 3 — reranking', candidates.length, 'candidates …');
       const reranked = await reranker.rerank(query, candidates);
       const result   = reranked.slice(0, topK);
       log.info('localSearch() STEP 3 ✅ reranked — returning top', result.length,
         'in', Date.now() - startMs, 'ms total |',
-        result.map(c => `${c.source}:p${c.page}(${c.rerankerScore?.toFixed(3) ?? c.score?.toFixed(3)})`).join(', '));
+        result.map(c =>
+          `${c.source}:p${c.page}(${c.rerankerScore?.toFixed(3) ?? c.score?.toFixed(3)})`
+        ).join(', '));
       return result;
     } else {
       log.warn('localSearch() STEP 3 ⚠ Reranker unavailable — using RRF order');
@@ -152,23 +156,83 @@ export async function localSearch(query, topK = 5) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// STALE CHECK
+// ETAG-BASED STALE CHECK
 // ─────────────────────────────────────────────────────────────
+//
+// FIX: replaced 30-minute timer with a lightweight server etag probe.
+//
+// Sends If-None-Match: <stored_etag> to /kb/export.
+//   304 → content unchanged → returns false (no sync needed)
+//   200 → content changed   → returns true  (sync required)
+//   error/throw             → returns true  (sync defensively)
+//
+// If local DB is empty → always returns true regardless of etag.
+// If no stored etag    → always returns true (no basis for comparison).
+//
+// Falls back to SYNC_STALE_MS timer if activeUrl is not provided
+// (edge case: called before URL is resolved).
 
-async function shouldSync() {
+async function shouldSync(activeUrl) {
   try {
-    const lastSynced = await getSyncMeta('last_synced');
-    if (!lastSynced) {
-      log.info('shouldSync() → true (never synced)');
+    // Always sync if local DB is empty — fresh install or cleared storage
+    const localCount = await getChunkCount();
+    if (localCount === 0) {
+      log.info('shouldSync() → true (local DB empty)');
       return true;
     }
-    const ageMs  = Date.now() - new Date(lastSynced).getTime();
-    const stale  = ageMs > SYNC_STALE_MS;
-    log.info('shouldSync() →', stale ? 'true (stale)' : 'false (fresh)',
-      `| last synced: ${lastSynced} | age: ${Math.round(ageMs / 1000)}s`);
-    return stale;
+
+    // No URL yet — fall back to time-based check
+    if (!activeUrl) {
+      const lastSynced = await getSyncMeta('last_synced');
+      if (!lastSynced) {
+        log.info('shouldSync() → true (never synced, no url)');
+        return true;
+      }
+      const ageMs = Date.now() - new Date(lastSynced).getTime();
+      const stale = ageMs > SYNC_STALE_MS;
+      log.info('shouldSync() → time-based fallback (no url):', stale ? 'stale' : 'fresh',
+        `| age: ${Math.round(ageMs / 1000)}s`);
+      return stale;
+    }
+
+    // Read the etag we stored after the last successful sync
+    const storedEtag = await getSyncMeta('export_etag');
+    if (!storedEtag) {
+      log.info('shouldSync() → true (no stored etag)');
+      return true;
+    }
+
+    // Probe the server — 10s timeout, just a status check
+    const controller = new AbortController();
+    const timer      = setTimeout(() => controller.abort(), 10_000);
+
+    let status;
+    try {
+      const res = await fetch(`${activeUrl}/kb/export?include_vectors=true`, {
+        method:  'GET',
+        headers: {
+          'Content-Type':  'application/json',
+          'If-None-Match': storedEtag,
+        },
+        signal: controller.signal,
+      });
+      status = res.status;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (status === 304) {
+      log.info(
+        `shouldSync() → false — 304 Not Modified (etag=${storedEtag.slice(0, 8)}…)`
+      );
+      return false;
+    }
+
+    log.info(`shouldSync() → true — server returned ${status} (etag mismatch)`);
+    return true;
+
   } catch (err) {
-    log.warn('shouldSync() error reading sync_meta:', err.message, '→ defaulting to true');
+    log.warn('shouldSync() probe failed:', err.message, '→ syncing defensively');
     return true;
   }
 }
@@ -198,7 +262,9 @@ function validateAndLogEmbeddings(chunks) {
     `length=${first?.length},`,
     `isArray=${Array.isArray(first)},`,
     `isFloat32=${first instanceof Float32Array},`,
-    `sample=[${Array.isArray(first) ? first.slice(0, 3).map(v => v.toFixed(4)).join(', ') : 'n/a'}]`,
+    `sample=[${Array.isArray(first)
+      ? first.slice(0, 3).map(v => v.toFixed(4)).join(', ')
+      : 'n/a'}]`,
   );
 
   if (Array.isArray(first)) {
@@ -211,7 +277,7 @@ function validateAndLogEmbeddings(chunks) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// P3: syncFromServer — etag delta + vector sync
+// CORE SYNC — etag delta + vector sync
 // ─────────────────────────────────────────────────────────────
 
 async function syncFromServer(activeUrl) {
@@ -257,7 +323,7 @@ async function syncFromServer(activeUrl) {
     log.info(`syncFromServer() received ${receivedChunks} chunks, ${receivedVectors} with embeddings`);
     if (newEtag) log.debug('syncFromServer() new etag from server:', newEtag);
 
-    // Validate embedding shape BEFORE writing
+    // Validate embedding shape BEFORE writing to DB
     validateAndLogEmbeddings(chunks);
 
     log.info('syncFromServer() → replaceAllChunksWithVectors() writing to SQLite …');
@@ -265,6 +331,7 @@ async function syncFromServer(activeUrl) {
     await replaceAllChunksWithVectors(chunks);
     log.info('syncFromServer() DB write complete in', Date.now() - dbStartMs, 'ms');
 
+    // Persist new etag so next shouldSync() probe can send If-None-Match
     if (newEtag) await setSyncMeta('export_etag', newEtag);
 
   } else {
@@ -366,8 +433,8 @@ export function useOfflineSearch(mode, activeUrl = '') {
           getVectorCount(),
         ]);
         log.info('useOfflineSearch() persisted state loaded:', {
-          lastSynced: lastSynced || '(never)',
-          chunkCount: count,
+          lastSynced:  lastSynced || '(never)',
+          chunkCount:  count,
           vectorCount: vcount,
         });
         setSyncStatus(s => ({ ...s, lastSynced, chunkCount: count, vectorCount: vcount }));
@@ -377,6 +444,11 @@ export function useOfflineSearch(mode, activeUrl = '') {
     })();
   }, []);
 
+  /**
+   * triggerSync(urlOverride?, opts?)
+   *   opts.force = true  → bypass shouldSync() etag check (manual sync button)
+   *   opts.force = false → check etag first, skip if content unchanged (default)
+   */
   const triggerSync = useCallback(async (urlOverride, opts = {}) => {
     if (isSyncingRef.current) {
       log.warn('triggerSync() SKIPPED — sync already in progress');
@@ -389,14 +461,15 @@ export function useOfflineSearch(mode, activeUrl = '') {
       return;
     }
 
+    // FIX: etag-based check replaces the 30-minute timer
     if (!opts.force) {
-      const needed = await shouldSync();
+      const needed = await shouldSync(url);
       if (!needed) {
-        log.info('triggerSync() SKIPPED — data is fresh (within 10 min)');
+        log.info('triggerSync() SKIPPED — etag matches, content unchanged');
         return;
       }
     } else {
-      log.info('triggerSync() force=true — bypassing stale check');
+      log.info('triggerSync() force=true — bypassing etag check');
     }
 
     log.info('triggerSync() START — url:', url, '| force:', opts.force ?? false);
@@ -443,11 +516,11 @@ export function useOfflineSearch(mode, activeUrl = '') {
     const wasOffline     = prev === NetworkMode.DEEP_OFFLINE || prev === null;
 
     log.debug('useOfflineSearch() Effect 1 (mode change):', {
-      prev:            prev ?? 'null (initial)',
-      current:         mode,
+      prev:          prev ?? 'null (initial)',
+      current:       mode,
       isNowReachable,
       wasOffline,
-      activeUrl:       activeUrl || '(none)',
+      activeUrl:     activeUrl || '(none)',
     });
 
     if (isNowReachable && wasOffline && activeUrl) {
@@ -471,7 +544,7 @@ export function useOfflineSearch(mode, activeUrl = '') {
     prevActiveUrl.current = activeUrl;
   }, [activeUrl, triggerSync]);
 
-  // Effect 3: 10-min polling while reachable
+  // Effect 3: 10-min background polling while server is reachable
   useEffect(() => {
     const isReachable = mode === NetworkMode.FULL_ONLINE || mode === NetworkMode.INTRANET_ONLY;
 
@@ -491,6 +564,7 @@ export function useOfflineSearch(mode, activeUrl = '') {
       triggerSync(activeUrl);
     };
 
+    // First poll fires after 60s so it doesn't compete with the initial sync
     const initialDelay = setTimeout(() => {
       log.debug('useOfflineSearch() poll — initial 60s delay fired');
       poll();

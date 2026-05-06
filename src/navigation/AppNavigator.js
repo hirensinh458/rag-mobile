@@ -1,10 +1,24 @@
+// src/navigation/AppNavigator.js
+//
+// SYNC FIX: useOfflineSearch is now owned here at the root navigator level.
+// It is exposed to all screens via SyncContext so there is only ever one
+// isSyncingRef, one etag store, and one triggerSync function in the app.
+//
+// ChatScreen and SettingsScreen both call useSyncContext() to get
+// { syncStatus, triggerSync } — no prop drilling, no stale closures,
+// no competing hook instances.
+
 import React from 'react';
-import { NavigationContainer } from '@react-navigation/native';
+import { NavigationContainer }      from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { Text } from 'react-native';
+import { Text }                     from 'react-native';
+
 import { ChatScreen }     from '../screens/ChatScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
-import { colors } from '../config/theme';
+import { useNetwork }     from '../hooks/useNetwork';
+import { useOfflineSearch } from '../hooks/useOfflineSearch';
+import { SyncContext }    from '../context/SyncContext';
+import { colors }         from '../config/theme';
 
 const Tab = createBottomTabNavigator();
 
@@ -14,12 +28,17 @@ const icon = (label) => ({ focused }) => (
   </Text>
 );
 
-export function AppNavigator() {
+// Inner component so useNetwork (which needs NavigationContainer) can be
+// called after the container mounts — lifted here so sync starts immediately.
+function AppTabs() {
+  const { mode, activeUrl } = useNetwork();
+  const { syncStatus, triggerSync } = useOfflineSearch(mode, activeUrl);
+
   return (
-    <NavigationContainer>
+    <SyncContext.Provider value={{ syncStatus, triggerSync }}>
       <Tab.Navigator
         screenOptions={{
-          headerShown:        false,
+          headerShown:             false,
           tabBarStyle: {
             backgroundColor: colors.bg1,
             borderTopColor:  colors.border,
@@ -29,12 +48,20 @@ export function AppNavigator() {
           },
           tabBarActiveTintColor:   colors.accent,
           tabBarInactiveTintColor: colors.text3,
-          tabBarLabelStyle:   { fontFamily: 'Courier New', fontSize: 11 },
+          tabBarLabelStyle: { fontFamily: 'Courier New', fontSize: 11 },
         }}
       >
-        <Tab.Screen name="Chat"     component={ChatScreen}     options={{ tabBarIcon: icon('Chat') }} />
+        <Tab.Screen name="Chat"     component={ChatScreen}     options={{ tabBarIcon: icon('Chat')     }} />
         <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarIcon: icon('Settings') }} />
       </Tab.Navigator>
+    </SyncContext.Provider>
+  );
+}
+
+export function AppNavigator() {
+  return (
+    <NavigationContainer>
+      <AppTabs />
     </NavigationContainer>
   );
 }

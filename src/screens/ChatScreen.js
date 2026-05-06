@@ -1,14 +1,11 @@
 // src/screens/ChatScreen.js
 //
-// CHANGES:
-//   - useNetwork() now returns `activeUrl` — threaded to useChat()
-//   - useOfflineSearch(mode, activeUrl) wired here so auto-sync actually runs
-//     (previously the hook was declared but never instantiated in the tree)
-//   - serverUrl loaded from AsyncStorage at mount time and passed to PdfViewer
-//     as an explicit prop (not re-read from storage on every PDF open)
-//   - PdfViewer now receives `mode` and `serverUrl` props
-//   - mode prop passed to OfflineChunkCard via MessageBubble so PDF availability
-//     check knows whether to look locally or use the server
+// SYNC FIX: useOfflineSearch removed from here — it now lives in AppNavigator
+// and is shared via SyncContext. ChatScreen calls useSyncContext() to read
+// syncStatus (for the "Syncing…" subtitle) without owning the hook.
+//
+// openSettings no longer needs to pass triggerSync as a nav param —
+// SettingsScreen reads it directly from SyncContext.
 
 import React, { useRef, useCallback, useState, useEffect } from 'react';
 import {
@@ -16,61 +13,59 @@ import {
   KeyboardAvoidingView, Platform,
   Text, TouchableOpacity,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
+import AsyncStorage          from '@react-native-async-storage/async-storage';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useNavigation }     from '@react-navigation/native';
 
-import { useChat }          from '../hooks/useChat';
-import { useNetwork }       from '../hooks/useNetwork';
-import { useOfflineSearch } from '../hooks/useOfflineSearch';
-import { MessageBubble }    from '../components/MessageBubble';
-import { NetworkBanner }    from '../components/NetworkBanner';
-import { ChatInput }        from '../components/ChatInput';
-import { PdfViewer }        from '../components/PdfViewer';
-import { Config }           from '../config';
+import { useChat }        from '../hooks/useChat';
+import { useNetwork }     from '../hooks/useNetwork';
+import { useSyncContext }  from '../context/SyncContext';
+import { MessageBubble }  from '../components/MessageBubble';
+import { NetworkBanner }  from '../components/NetworkBanner';
+import { ChatInput }      from '../components/ChatInput';
+import { PdfViewer }      from '../components/PdfViewer';
+import { Config }         from '../config';
 import { colors, spacing, typography, radius, minTapTarget } from '../config/theme';
 
 const MODE_CONFIG = {
-  full_online:   { label: 'ONLINE',     dot: colors.online },
+  full_online:   { label: 'ONLINE',     dot: colors.online   },
   intranet_only: { label: 'AT SEA',     dot: colors.intranet },
-  deep_offline:  { label: 'LOCAL ONLY', dot: colors.offline },
+  deep_offline:  { label: 'LOCAL ONLY', dot: colors.offline  },
 };
 
 export function ChatScreen() {
+  const navigation = useNavigation();
   const { mode, activeUrl, serverReachable, serverHasInternet } = useNetwork();
   const { messages, streaming, statusText, send, clear }        = useChat(activeUrl);
-
-  // Wire auto-sync — MUST be instantiated here so it's active.
-  // Previously this hook was declared but never used in ChatScreen,
-  // meaning auto-sync never fired.
-  const { syncStatus } = useOfflineSearch(mode, activeUrl);
+  const { syncStatus }  = useSyncContext();   // read-only — hook lives in AppNavigator
 
   const flatListRef = useRef(null);
   const insets      = useSafeAreaInsets();
 
-  // PDF viewer state lifted here so any message or chunk card can trigger it
   const [pdfViewer, setPdfViewer] = useState(null);
-
-  // Load serverUrl once at mount and keep it stable.
-  // PdfViewer gets this as an explicit prop so it never has to re-read storage.
   const [serverUrl, setServerUrl] = useState('');
+
   useEffect(() => {
     (async () => {
-      const cloud = await AsyncStorage.getItem('cloud_url');
-      const local = await AsyncStorage.getItem('local_url');
+      const cloud  = await AsyncStorage.getItem('cloud_url');
+      const local  = await AsyncStorage.getItem('local_url');
       const legacy = await AsyncStorage.getItem('server_url');
-      // Prefer activeUrl if already resolved; fall back through storage keys
       const resolved = activeUrl
-        || (cloud && cloud.trim())
-        || (local && local.trim())
+        || (cloud  && cloud.trim())
+        || (local  && local.trim())
         || (legacy && legacy.trim())
         || Config.API_BASE_URL;
       setServerUrl(resolved);
     })();
-  }, [activeUrl]); // re-resolve when activeUrl changes
+  }, [activeUrl]);
+
+  // Simple navigate — no params needed, SettingsScreen uses SyncContext directly
+  const openSettings = useCallback(() => {
+    navigation.navigate('Settings');
+  }, [navigation]);
 
   const modeConf = MODE_CONFIG[mode] || MODE_CONFIG.full_online;
 
-  // ── Auto-scroll on new message ──────────────────────────────────────────
   useEffect(() => {
     if (messages.length > 0) {
       const t = setTimeout(() => {
@@ -86,7 +81,6 @@ export function ChatScreen() {
     }
   }, [messages, streaming]);
 
-  // ── Callbacks ────────────────────────────────────────────────────────────
   const handleOpenPdf = useCallback((source, page, bbox) => {
     setPdfViewer({ filename: source, page: page || 1, bbox: bbox || null });
   }, []);
@@ -100,13 +94,11 @@ export function ChatScreen() {
   return (
     <View style={styles.root}>
 
-      {/* ── Status banner (slides in when not fully online) ── */}
       <NetworkBanner
         serverReachable={serverReachable}
         serverHasInternet={serverHasInternet}
       />
 
-      {/* ── Header ── */}
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>MarineDoc</Text>
@@ -123,6 +115,13 @@ export function ChatScreen() {
           </View>
           <TouchableOpacity
             style={styles.clearBtn}
+            onPress={openSettings}
+            hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+          >
+            <Text style={styles.clearBtnText}>⚙</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.clearBtn}
             onPress={clear}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
           >
@@ -131,17 +130,10 @@ export function ChatScreen() {
         </View>
       </View>
 
-      {/*
-       * KeyboardAvoidingView wraps BOTH the FlatList and ChatInput.
-       * iOS:     'padding' — pushes everything up by keyboard height
-       * Android: 'height'  — shrinks the view height (requires
-       *          android:windowSoftInputMode="adjustResize" in manifest)
-       */}
       <KeyboardAvoidingView
         style={styles.flex}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       >
-        {/* ── Message list ── */}
         <FlatList
           ref={flatListRef}
           data={messages}
@@ -158,7 +150,6 @@ export function ChatScreen() {
           ListEmptyComponent={<EmptyState mode={mode} />}
         />
 
-        {/* ── Input (always above keyboard because it's inside KAV) ── */}
         <ChatInput
           onSend={(text) => send(text, mode)}
           disabled={streaming}
@@ -167,7 +158,6 @@ export function ChatScreen() {
         />
       </KeyboardAvoidingView>
 
-      {/* PDF viewer rendered outside KAV so it's truly fullscreen */}
       {pdfViewer && (
         <PdfViewer
           filename={pdfViewer.filename}
@@ -184,9 +174,9 @@ export function ChatScreen() {
 
 function EmptyState({ mode }) {
   const content = {
-    full_online:   { icon: '◈', title: 'Ask anything about the ship manual', hint: 'AI-powered answers with citations' },
+    full_online:   { icon: '◈', title: 'Ask anything about the ship manual', hint: 'AI-powered answers with citations'  },
     intranet_only: { icon: '⚓', title: 'At sea — retrieval mode active',     hint: 'Returns manual sections, no AI generation' },
-    deep_offline:  { icon: '📵', title: 'Server unreachable',                 hint: 'Searching local database only' },
+    deep_offline:  { icon: '📵', title: 'Server unreachable',                 hint: 'Searching local database only'     },
   }[mode] || { icon: '◈', title: 'Ask anything', hint: '' };
 
   return (
@@ -201,7 +191,6 @@ function EmptyState({ mode }) {
 const styles = StyleSheet.create({
   root:  { flex: 1, backgroundColor: colors.bg0 },
   flex:  { flex: 1 },
-
   header: {
     flexDirection:     'row',
     alignItems:        'center',
@@ -214,9 +203,9 @@ const styles = StyleSheet.create({
     borderBottomColor: colors.border,
   },
   title: {
-    fontSize:     typography.fontSize.xl,
-    color:        colors.text0,
-    fontWeight:   '700',
+    fontSize:      typography.fontSize.xl,
+    color:         colors.text0,
+    fontWeight:    '700',
     letterSpacing: -0.5,
   },
   subtitle: {
@@ -225,9 +214,8 @@ const styles = StyleSheet.create({
     fontFamily: typography.fontMono,
     marginTop:  2,
   },
-
   headerRight: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  modeBadge:   {
+  modeBadge: {
     flexDirection:     'row',
     alignItems:        'center',
     gap:               5,
@@ -236,32 +224,30 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.sm,
     paddingVertical:   4,
   },
-  modeDot:  { width: 6, height: 6, borderRadius: 3 },
-  modeLabel:{
-    fontSize:     typography.fontSize.xs,
-    fontFamily:   typography.fontMono,
+  modeDot:   { width: 6, height: 6, borderRadius: 3 },
+  modeLabel: {
+    fontSize:      typography.fontSize.xs,
+    fontFamily:    typography.fontMono,
     letterSpacing: 0.7,
-    fontWeight:   '600',
+    fontWeight:    '600',
   },
   clearBtn: {
-    width:          32,
-    height:         32,
-    borderRadius:   radius.full,
+    width:           32,
+    height:          32,
+    borderRadius:    radius.full,
     backgroundColor: colors.bg3,
-    alignItems:     'center',
-    justifyContent: 'center',
-    borderWidth:    1,
-    borderColor:    colors.border,
+    alignItems:      'center',
+    justifyContent:  'center',
+    borderWidth:     1,
+    borderColor:     colors.border,
   },
   clearBtnText: { color: colors.text2, fontSize: 14 },
-
   listContent: {
     paddingHorizontal: spacing.md,
     paddingTop:        spacing.md,
     paddingBottom:     spacing.xl,
   },
-  listFlex: { flex: 1 },
-
+  listFlex:   { flex: 1 },
   emptyWrap: {
     flex:              1,
     alignItems:        'center',
