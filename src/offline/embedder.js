@@ -90,73 +90,45 @@ function toInt64Buffer(arr) {
 
 // src/offline/embedder.js
 
+// src/offline/embedder.js — simplified embed() for the new pooled model
+// ... (keep all imports, model loading, tokenizer import, etc. unchanged) ...
+
+/**
+ * Embed a query text into a 384-dim Float32Array (already L2-normalised).
+ * The new model outputs a single [1, 384] vector — no further processing needed.
+ */
 async function embed(text) {
   if (!_session) throw new Error('[EMBEDDER] Session not initialised');
 
+  // Apply the BGE query prefix (same as the Python backend)
+  text = `Represent this sentence for searching relevant passages: ${text}`;
+
   const { inputIds, attentionMask, tokenTypeIds } = await _tokenize(text);
 
+  // Ensure exactly 128 tokens (the model expects fixed‑size input)
+  const clampedIds   = inputIds.slice(0, MAX_SEQ_LEN);
+  const clampedMask  = attentionMask.slice(0, MAX_SEQ_LEN);
+  const clampedToken = tokenTypeIds.slice(0, MAX_SEQ_LEN);
+
   const feeds = {
-    input_ids: toInt64Buffer(inputIds),
-    attention_mask: toInt64Buffer(attentionMask),
-    token_type_ids: toInt64Buffer(tokenTypeIds),
+    input_ids:       toInt64Buffer(clampedIds),
+    attention_mask:  toInt64Buffer(clampedMask),
+    token_type_ids:  toInt64Buffer(clampedToken),
   };
 
   const results = _session.runAsync
     ? await _session.runAsync(feeds)
     : _session.run(feeds);
 
-  const outputKey = _session.outputNames?.[0]?.name
-    ?? _session.outputNames?.[0]
-    ?? 'last_hidden_state';
+  // The output key is "embedding" — a Float32Array of length 384
+  const outputKey = _session.outputNames?.[0]?.name ?? 'embedding';
+  const embedding = new Float32Array(results[outputKey]);
 
-  const rawBuffer = results[outputKey];
-  if (!rawBuffer) {
-    throw new Error(
-      `[EMBEDDER] No output for key "${outputKey}". ` +
-      `Available: ${Object.keys(results).join(', ')}`
-    );
-  }
-
-  // src/offline/embedder.js — replace everything after rawBuffer check
-
-  const hidden = new Float32Array(rawBuffer);
-  const DIM = 384;
-
-  let embedding;
-
-  if (hidden.length === DIM) {
-    // Model already outputs a pooled [384] vector — use it directly
-    console.log('[Embedder] Model has built-in pooling, skipping mean pool');
-    embedding = hidden;
-  } else {
-    // Full hidden state [seq_len, 384] — do mean pooling ourselves
-    const seqLen = inputIds.length;
-
-    if (hidden.length < seqLen * DIM) {
-      throw new Error(`[EMBEDDER] Output shape mismatch: got ${hidden.length}, expected ${seqLen * DIM}`);
-    }
-
-    const meanVec = new Float32Array(DIM);
-    let maskedCount = 0;
-
-    for (let pos = 0; pos < seqLen; pos++) {
-      const mask = attentionMask[pos];
-      if (mask === 0) continue;
-      maskedCount++;
-      for (let dim = 0; dim < DIM; dim++) {
-        meanVec[dim] += hidden[pos * DIM + dim];
-      }
-    }
-    for (let dim = 0; dim < DIM; dim++) {
-      meanVec[dim] /= maskedCount || 1;
-    }
-
-    embedding = meanVec;
-  }
-
-  // ── L2 NORMALISE ───────────────────────────────────────────
+  // Verification log (optional)
   const norm = Math.sqrt(embedding.reduce((s, v) => s + v * v, 0));
-  return Float32Array.from(embedding, v => v / (norm || 1));
+  console.log('[Embedder] Output norm:', norm.toFixed(4)); // should be ~1.0000
+
+  return embedding;
 }
 
 // ─────────────────────────────────────────────────────────────
