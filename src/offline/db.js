@@ -1,44 +1,25 @@
-// src/offline/db.js  — P2 + P3 + P4 + FIX-VECTORS + FIX-UNIQUE + SEARCH-MODE-LOGGING + FIX-TRANSACTION
+// src/offline/db.js  — P2 + P3 + P4 + FIX-TRANSACTION + parent_id-EXPORT + MUTEX
 //
 // CHANGES FROM PREVIOUS VERSION:
 //
-//   FIX — "cannot start a transaction within a transaction"
-//     PROBLEM:
-//       expo-sqlite's withTransactionAsync() calls execAsync('BEGIN') internally.
-//       execAsync() cannot be called while any transaction is already open on the
-//       same database connection. When two sync triggers fire close together at
-//       startup (Effect 1 + Effect 2 in useOfflineSearch both fire), the second
-//       call to replaceAllChunksWithVectors() arrives while the first transaction
-//       is still open, and the nested execAsync('BEGIN') throws.
-//     FIX:
-//       Replace every withTransactionAsync() call with manual
-//       BEGIN / COMMIT / ROLLBACK using runAsync(), which does not call
-//       execAsync() and is safe to use without the nested-transaction restriction.
-//       A try/catch wraps the entire block so ROLLBACK always fires on error,
-//       leaving the DB in a clean state for the next operation.
+//   MUTEX ADDED — replaceAllChunksWithVectors() now uses a serial queue so
+//                only one full replacement runs at any moment. Fixes the
+//                "cannot start a transaction within a transaction" error
+//                when two sync triggers overlap.
 //
-//   KEPT — All other P2/P3/P4/FIX-VECTORS/FIX-UNIQUE/SEARCH-MODE-LOGGING logic.
-//
-// LOGGING ADDED: Every DB lifecycle event — init, extension load, schema creation,
-// each transaction (BEGIN/COMMIT/ROLLBACK), per-chunk insert errors, deduplication
-// stats, vector validation, FTS5 and KNN search results, hybrid RRF merge, and
-// all metadata reads/writes — is logged via createLogger('db').
+//   KEPT — All previous changes: parent_id column, manual BEGIN/COMMIT/ROLLBACK,
+//          P4 hybrid search, logging, etc.
 
 import * as SQLite     from 'expo-sqlite';
 import * as FileSystem from 'expo-file-system/legacy';
 import { Platform }    from 'react-native';
 import { createLogger } from '../utils/logger';
 
-// Module-level logger — all lines tagged [db]
 const log = createLogger('db');
 
 // ─────────────────────────────────────────────────────────────
 // BLOB HELPER
 // ─────────────────────────────────────────────────────────────
-//
-// expo-sqlite runAsync() cannot bind ArrayBuffer — only Uint8Array.
-// Float32Array.buffer gives ArrayBuffer → TypeError on bind.
-// toVecBlob() normalises all input types to Uint8Array.
 
 function toVecBlob(embedding) {
   if (embedding instanceof Uint8Array) {
@@ -49,13 +30,12 @@ function toVecBlob(embedding) {
     log.debug('toVecBlob() — converting Float32Array → Uint8Array');
     return new Uint8Array(embedding.buffer);
   }
-  // Plain number[] from JSON (most common — server payload)
   log.debug('toVecBlob() — converting plain number[] → Float32Array → Uint8Array');
   return new Uint8Array(new Float32Array(embedding).buffer);
 }
 
 // ─────────────────────────────────────────────────────────────
-// DB SINGLETON — promise-guarded to prevent concurrent init
+// DB SINGLETON
 // ─────────────────────────────────────────────────────────────
 
 let _db     = null;
@@ -87,7 +67,7 @@ async function _initDb() {
   await db.execAsync('PRAGMA journal_mode = WAL;');
   log.debug('_initDb() WAL journal mode set');
 
-  // ── Load sqlite-vec native extension ──────────────────────
+  // ── Load sqlite-vec extension ──────────────────────
   try {
     const libName = Platform.OS === 'android' ? 'vec0' : 'vec0.dylib';
     log.info('_initDb() loading sqlite-vec extension:', libName);
@@ -97,14 +77,15 @@ async function _initDb() {
     log.warn('_initDb() ⚠ sqlite-vec not available — BM25-only fallback:', e.message);
   }
 
-  // ── Schema ────────────────────────────────────────────────
-  log.debug('_initDb() creating schema (IF NOT EXISTS) …');
+  // ── Schema ────────────────────────────────────────
+  log.debug('_initDb() creating schema …');
   await db.execAsync(`
     CREATE TABLE IF NOT EXISTS chunks (
       id             TEXT    PRIMARY KEY,
       source         TEXT    NOT NULL DEFAULT '',
       content        TEXT    NOT NULL DEFAULT '',
       parent_content TEXT    NOT NULL DEFAULT '',
+      parent_id      TEXT    NOT NULL DEFAULT '',   -- NEW
       page           INTEGER NOT NULL DEFAULT 0,
       chunk_type     TEXT    NOT NULL DEFAULT 'text',
       section_path   TEXT    NOT NULL DEFAULT '',
@@ -130,6 +111,14 @@ async function _initDb() {
   `);
   log.debug('_initDb() main schema ready');
 
+  // Migrate existing installs: add parent_id if missing
+  try {
+    await db.execAsync('ALTER TABLE chunks ADD COLUMN parent_id TEXT NOT NULL DEFAULT \'\';');
+    log.debug('_initDb() added parent_id column (or already existed)');
+  } catch (_) {
+    // column already exists — safe to ignore
+  }
+
   // vec_chunks — requires extension already loaded
   try {
     await db.execAsync(`
@@ -149,21 +138,27 @@ async function _initDb() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// P3: CHUNK OPERATIONS — REPLACE WITH VECTORS
+// MUTEX – serialises replaceAllChunksWithVectors() calls
 // ─────────────────────────────────────────────────────────────
 
-/**
- * Atomically replace ALL stored chunks, FTS index, AND vector embeddings.
- *
- * FIX: Uses manual BEGIN/COMMIT/ROLLBACK via runAsync() instead of
- * withTransactionAsync(). withTransactionAsync() calls execAsync('BEGIN')
- * internally, which throws "cannot start a transaction within a transaction"
- * when two sync triggers overlap at startup. runAsync('BEGIN') does not
- * have this restriction.
- *
- * @param {Array} chunks — chunk objects from /kb/export (with .embedding field)
- */
+let _replaceMutex = Promise.resolve();
+
+function withMutex(fn) {
+  const prev = _replaceMutex;
+  let release;
+  _replaceMutex = new Promise(resolve => { release = resolve; });
+  return prev.then(() => fn()).finally(release);
+}
+
+// ─────────────────────────────────────────────────────────────
+// CHUNK OPERATIONS — REPLACE WITH VECTORS (mutex-guarded)
+// ─────────────────────────────────────────────────────────────
+
 export async function replaceAllChunksWithVectors(chunks) {
+  return withMutex(() => _replaceAllChunksWithVectors(chunks));
+}
+
+async function _replaceAllChunksWithVectors(chunks) {
   log.info('replaceAllChunksWithVectors() START — received', chunks.length, 'chunks');
   const startMs = Date.now();
 
@@ -193,8 +188,7 @@ export async function replaceAllChunksWithVectors(chunks) {
   }
   log.info('replaceAllChunksWithVectors() writing', unique.length, 'unique chunks …');
 
-  // FIX: manual transaction — runAsync('BEGIN') is safe even when another
-  // async operation is in flight; withTransactionAsync/execAsync('BEGIN') is not.
+  // FIX: manual transaction
   try {
     log.debug('replaceAllChunksWithVectors() BEGIN transaction');
     await db.runAsync('BEGIN;');
@@ -213,25 +207,26 @@ export async function replaceAllChunksWithVectors(chunks) {
 
     // Insert each chunk
     for (let i = 0; i < unique.length; i++) {
-      const c      = unique[i];
-      const id     = c._resolvedId;
+      const c        = unique[i];
+      const id       = c._resolvedId;
       const bboxJson = Array.isArray(c.bbox) ? JSON.stringify(c.bbox) : null;
 
       if (i % 100 === 0 && i > 0) {
         log.debug(`replaceAllChunksWithVectors() progress: ${i}/${unique.length} chunks inserted`);
       }
 
-      // 1. Main chunks table
+      // 1. Main chunks table (now includes parent_id)
       await db.runAsync(
         `INSERT OR REPLACE INTO chunks
-           (id, source, content, parent_content, page, chunk_type,
+           (id, source, content, parent_content, parent_id, page, chunk_type,
             section_path, heading, bbox, page_width, page_height)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           id,
           c.source         || '',
           c.content        || '',
           c.parent_content || c.content || '',
+          c.parent_id      || '',                 // NEW
           c.page           ?? 0,
           c.chunk_type     || 'text',
           c.section_path   || '',
@@ -250,7 +245,7 @@ export async function replaceAllChunksWithVectors(chunks) {
 
       // 3. Vector index
       if (!c.embedding || !Array.isArray(c.embedding) || c.embedding.length === 0) {
-        continue; // no embedding — skip vector insert (already logged by validator)
+        continue;
       }
       if (c.embedding.length !== 384) {
         log.warn(`replaceAllChunksWithVectors() wrong embedding dim for ${id}:`,
@@ -261,9 +256,6 @@ export async function replaceAllChunksWithVectors(chunks) {
 
       try {
         const blob = toVecBlob(c.embedding);
-
-        // INSERT OR IGNORE — vec0 virtual table does not support ON CONFLICT
-        // replacement; OR IGNORE silently skips duplicates (already deduped above).
         await db.runAsync(
           'INSERT OR IGNORE INTO vec_chunks (id, embedding) VALUES (?, ?)',
           [id, blob],
@@ -279,8 +271,6 @@ export async function replaceAllChunksWithVectors(chunks) {
     log.info('replaceAllChunksWithVectors() COMMIT — transaction complete');
 
   } catch (err) {
-    // Always roll back on any error so the DB is never left in a
-    // partial-transaction state that would block all future operations.
     log.error('replaceAllChunksWithVectors() ERROR inside transaction — rolling back:', err.message);
     try { await db.runAsync('ROLLBACK;'); } catch (_) {
       log.error('replaceAllChunksWithVectors() ROLLBACK also failed — DB may be in bad state');
@@ -308,7 +298,7 @@ export async function replaceAllChunksWithVectors(chunks) {
 export const replaceAllChunks = replaceAllChunksWithVectors;
 
 // ─────────────────────────────────────────────────────────────
-// P4: HYBRID SEARCH — BM25 + KNN + RRF
+// HYBRID SEARCH — BM25 + KNN + RRF
 // ─────────────────────────────────────────────────────────────
 
 const RRF_K = 60;
@@ -334,19 +324,6 @@ function rrfMerge(resultLists, topK) {
   return merged;
 }
 
-/**
- * Hybrid search: BM25 (FTS5) + Semantic KNN (sqlite-vec) → RRF merge.
- *
- * Every result carries a _searchMode field:
- *   "hybrid" — both BM25 and KNN contributed via RRF
- *   "bm25"   — BM25 only (embedder unavailable or KNN returned empty)
- *   "knn"    — KNN only (BM25 returned empty, very rare)
- *
- * @param {string}                    query      — raw user query text
- * @param {Float32Array|number[]|null} queryVec  — on-device embedded query (null = BM25 only)
- * @param {number}                    topK       — final results to return
- * @param {number}                    candidateK — candidates per source before merge
- */
 export async function hybridSearchChunks(query, queryVec = null, topK = 5, candidateK = 20) {
   log.info('hybridSearchChunks() START', {
     query:      query.trim().slice(0, 100),
@@ -376,7 +353,7 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
   let bm25Results = [];
   try {
     const rows = await db.getAllAsync(
-      `SELECT c.id, c.source, c.content, c.parent_content, c.page,
+      `SELECT c.id, c.source, c.content, c.parent_content, c.parent_id, c.page,
               c.chunk_type, c.section_path, c.heading,
               c.bbox, c.page_width, c.page_height,
               bm25(chunks_fts) AS bm25_score
@@ -389,8 +366,9 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
     );
     bm25Results = rows.map(r => ({
       ...r,
-      content: r.parent_content || r.content,
-      bbox:    r.bbox ? JSON.parse(r.bbox) : null,
+      content:   r.parent_content || r.content,
+      parent_id: r.parent_id || '',                // NEW
+      bbox:      r.bbox ? JSON.parse(r.bbox) : null,
     }));
     log.info('hybridSearchChunks() BM25 (FTS5) →', bm25Results.length, 'results');
   } catch (e) {
@@ -426,7 +404,7 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
           const ids          = vecRows.map(r => r.id);
           const placeholders = ids.map(() => '?').join(',');
           const chunkRows    = await db.getAllAsync(
-            `SELECT id, source, content, parent_content, page,
+            `SELECT id, source, content, parent_content, parent_id, page,
                     chunk_type, section_path, heading,
                     bbox, page_width, page_height
              FROM chunks WHERE id IN (${placeholders})`,
@@ -439,11 +417,22 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
               const chunk = chunkMap.get(r.id);
               return {
                 ...chunk,
-                content: chunk.parent_content || chunk.content,
-                bbox:    chunk.bbox ? JSON.parse(chunk.bbox) : null,
+                content:   chunk.parent_content || chunk.content,
+                parent_id: chunk.parent_id || '',      // NEW
+                bbox:      chunk.bbox ? JSON.parse(chunk.bbox) : null,
               };
             });
           log.info('hybridSearchChunks() KNN →', vecResults.length, 'results after chunk join');
+          // ── SEMANTIC SEARCH ONLY LOG ──────────────────────────
+          console.log(`[SEMANTIC/OFFLINE] Query embedding first 10: [${Array.from(queryVec.slice(0, 10)).join(', ')}]`);
+          console.log(`[SEMANTIC/OFFLINE] Query embedding norm: ${Math.sqrt(queryVec.reduce((s, v) => s + v * v, 0))}`);
+          console.log(`[SEMANTIC/OFFLINE] Full embedding (${queryVec.length} dims): [${Array.from(queryVec).join(', ')}]`);
+          console.log(`[SEMANTIC/OFFLINE] KNN returned ${vecResults.length} results:`);
+          vecResults.forEach((r, i) => {
+            console.log(`[SEMANTIC/OFFLINE] KNN[${i}] src=${r.source} p=${r.page} dist=${r._distance} content="${r.content?.slice(0, 80).replace(/\n/g, ' ')}"`);
+          });
+          // ───────────────────────────────────────────────────────
+
         }
       } catch (e) {
         log.warn('hybridSearchChunks() KNN search FAILED:', e.message);
@@ -453,7 +442,7 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
     log.debug('hybridSearchChunks() KNN skipped — no queryVec (embedder unavailable)');
   }
 
-  // ── 3. Determine mode, log summary, RRF merge ─────────────
+  // ── 3. Determine mode and merge ───────────────────────────
   const hasBM25 = bm25Results.length > 0;
   const hasKNN  = vecResults.length  > 0;
 
@@ -497,7 +486,7 @@ export async function hybridSearchChunks(query, queryVec = null, topK = 5, candi
 }
 
 // ─────────────────────────────────────────────────────────────
-// BM25-ONLY SEARCH (backward compat + internal fallback)
+// BM25-ONLY SEARCH (backward compat)
 // ─────────────────────────────────────────────────────────────
 
 export async function searchChunks(query, topK = 5) {
@@ -510,7 +499,7 @@ async function _fallbackSearch(query, topK) {
   const db      = await getDb();
   const pattern = `%${query.trim()}%`;
   const rows    = await db.getAllAsync(
-    `SELECT id, source, content, parent_content, page, chunk_type,
+    `SELECT id, source, content, parent_content, parent_id, page, chunk_type,
             section_path, heading, bbox, page_width, page_height,
             1.0 AS score
      FROM chunks
@@ -521,9 +510,10 @@ async function _fallbackSearch(query, topK) {
   log.info('_fallbackSearch() → returned', rows.length, 'rows');
   return rows.map(r => ({
     ...r,
-    content: r.parent_content || r.content,
-    bbox:    r.bbox ? JSON.parse(r.bbox) : null,
-    score:   r.score,
+    content:   r.parent_content || r.content,
+    parent_id: r.parent_id || '',           // NEW
+    bbox:      r.bbox ? JSON.parse(r.bbox) : null,
+    score:     r.score,
   }));
 }
 
@@ -573,28 +563,30 @@ export async function clearChunks() {
   const db      = await getDb();
   const startMs = Date.now();
 
-  // FIX: manual transaction — same reason as replaceAllChunksWithVectors above
-  try {
-    await db.runAsync('BEGIN;');
-    await db.runAsync('DELETE FROM chunks;');
-    await db.runAsync('DELETE FROM chunks_fts;');
-    log.debug('clearChunks() chunks + FTS cleared');
+  // FIX: manual transaction + mutex (via withMutex)
+  return withMutex(async () => {
     try {
-      await db.runAsync('DELETE FROM vec_chunks;');
-      log.debug('clearChunks() vec_chunks cleared');
-    } catch (e) {
-      log.warn('clearChunks() vec_chunks clear skipped:', e.message);
+      await db.runAsync('BEGIN;');
+      await db.runAsync('DELETE FROM chunks;');
+      await db.runAsync('DELETE FROM chunks_fts;');
+      log.debug('clearChunks() chunks + FTS cleared');
+      try {
+        await db.runAsync('DELETE FROM vec_chunks;');
+        log.debug('clearChunks() vec_chunks cleared');
+      } catch (e) {
+        log.warn('clearChunks() vec_chunks clear skipped:', e.message);
+      }
+      await db.runAsync('COMMIT;');
+    } catch (err) {
+      log.error('clearChunks() ERROR — rolling back:', err.message);
+      try { await db.runAsync('ROLLBACK;'); } catch (_) {
+        log.error('clearChunks() ROLLBACK also failed');
+      }
+      throw err;
     }
-    await db.runAsync('COMMIT;');
-  } catch (err) {
-    log.error('clearChunks() ERROR — rolling back:', err.message);
-    try { await db.runAsync('ROLLBACK;'); } catch (_) {
-      log.error('clearChunks() ROLLBACK also failed');
-    }
-    throw err;
-  }
 
-  log.info('clearChunks() ✅ DONE in', Date.now() - startMs, 'ms');
+    log.info('clearChunks() ✅ DONE in', Date.now() - startMs, 'ms');
+  });
 }
 
 // ─────────────────────────────────────────────────────────────

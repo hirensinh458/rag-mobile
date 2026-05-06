@@ -1,23 +1,18 @@
-// src/hooks/useChat.js  — P4: Mode 3 now uses localSearch (hybrid BM25+KNN)
+// src/hooks/useChat.js  — P4 + parent_id-DEDUP
 //
 // CHANGES FROM PREVIOUS VERSION:
-//   - Mode 3 deep_offline path now calls localSearch() from useOfflineSearch
-//     instead of searchChunks() from db.js directly.
-//   - localSearch() embeds the query on-device and runs hybridSearchChunks()
-//     (BM25 + KNN + RRF). Falls back to BM25-only if embedder unavailable.
-//   - topK raised to 10 candidates before slicing to 5 for display (same as before)
-//   - All other modes (1 and 2) unchanged.
-//
-// LOGGING ADDED: Every call to send() is traced end-to-end — mode routing
-// decision, per-step progress, token streaming milestones, final outcome,
-// and all error paths — via createLogger('useChat').
+//   - Mode 3 deep_offline now deduplicates results on parent_id before display,
+//     matching the dedup logic in ChainResponse.get_citations() (online mode).
+//   - Dedup key = parent_id if non-empty, else source|page (same fallback).
+//   - Only the highest-scoring child per parent is kept; stops at 5 unique parents.
+//   - localSearch() still fetches 10 candidates to give the dedup enough material.
+//   - All other modes and logging remain unchanged.
 
 import { useState, useCallback, useRef } from 'react';
 import { streamChat, fetchOfflineResponse, clearSession } from '../api/chat';
 import { localSearch } from './useOfflineSearch';  // P4: hybrid search
 import { createLogger } from '../utils/logger';
 
-// Module-level logger — all lines tagged [useChat]
 const log = createLogger('useChat');
 
 /**
@@ -37,7 +32,7 @@ export function useChat(activeUrl = '') {
    *
    * Mode 1 full_online   — XHR SSE stream to /chat/stream (Groq LLM)
    * Mode 2 intranet_only — POST /chat/offline (server-side retrieval)
-   * Mode 3 deep_offline  — local hybrid search via localSearch() [P4]
+   * Mode 3 deep_offline  — local hybrid search → dedup → display
    */
   const send = useCallback(async (question, mode = 'full_online', pinnedFile = null) => {
     log.info('send() CALLED', {
@@ -58,9 +53,9 @@ export function useChat(activeUrl = '') {
     log.debug('send() adding user message id:', userMsg.id);
     setMessages(prev => [...prev, userMsg]);
 
-    // ── MODE 3: Deep offline — local hybrid BM25+KNN search ──────────────
+    // ── MODE 3: Deep offline — local hybrid search + parent_id dedup ─────
     if (mode === 'deep_offline') {
-      log.info('send() → ROUTE: MODE 3 (deep_offline) — local hybrid search');
+      log.info('send() → ROUTE: MODE 3 (deep_offline) — local hybrid search + dedup');
 
       setMessages(prev => [...prev, {
         id: assistantId, role: 'assistant', content: '',
@@ -73,13 +68,52 @@ export function useChat(activeUrl = '') {
 
       try {
         log.info('send() [MODE 3] calling localSearch() — topK=10');
-        // Request 10 candidates — RRF merge then slice to top 5 for display.
+        // Fetch 10 candidates to give dedup enough material.
         const rawChunks = await localSearch(question, 10); // P4: hybrid search
 
-        log.info('send() [MODE 3] localSearch() returned', rawChunks.length,
-          'candidates in', Date.now() - startMs, 'ms — slicing to top 5');
+        // ── NEW: Log all offline retrieval chunks for comparison ──────────
+        console.log(
+          `[OFFLINE/RAW] searchChunks returned ${rawChunks.length} candidates`
+        );
+        rawChunks.forEach((c, i) => {
+          console.log(
+            `[OFFLINE/RAW] chunk[${i}] src=${c.source} p=${c.page} score=${c.score?.toFixed(4)} content_preview="${c.content?.slice(0, 60).replace(/\n/g, ' ')}"`
+          );
+        });
+        // ──────────────────────────────────────────────────────────────────
 
-        const chunks = rawChunks.slice(0, 5).map(c => ({
+
+        log.info('send() [MODE 3] localSearch() returned', rawChunks.length,
+          'candidates in', Date.now() - startMs, 'ms — starting dedup');
+
+        // ── NEW: parent_id dedup (mirrors ChainResponse.get_citations()) ──
+        const dedupedChunks = [];
+        const seenParents = new Set();
+
+        for (const chunk of rawChunks) {
+          // Determine the dedup key: parent_id if available, else source|page.
+          // This matches the online pipeline:
+          //   if parent_id is non-empty -> use parent_id
+          //   else fallback to "source|page"
+          const key = chunk.parent_id
+            ? chunk.parent_id
+            : `${chunk.source}|${chunk.page ?? 0}`;
+
+          if (seenParents.has(key)) {
+            log.debug(`send() [MODE 3] dedup — dropping ${chunk.source}:p${chunk.page} (already seen key: ${key})`);
+            continue;
+          }
+          seenParents.add(key);
+          dedupedChunks.push(chunk);
+          if (dedupedChunks.length >= 5) break; // limit to 5 unique parents
+        }
+
+        log.info('send() [MODE 3] dedup complete —', dedupedChunks.length,
+          'unique parents kept out of', rawChunks.length, 'candidates',
+          `(seen: ${seenParents.size})`);
+
+        // ── Map to final chunk objects for display ───────────────────────
+        const chunks = dedupedChunks.map(c => ({
           source: c.source,
           page: c.page,
           content: c.parent_content || c.content,
